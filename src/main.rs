@@ -10,9 +10,9 @@ use clan_edit::ast;
 #[derive(Parser)]
 #[command(name = "clan-edit", about = "Edit clan.nix inventory files")]
 struct Cli {
-    /// Path to the clan.nix file
-    #[arg(short, long, default_value = "clan.nix")]
-    file: PathBuf,
+    /// Path to the clan.nix file (auto-discovered via definitionsWithLocations if omitted)
+    #[arg(short, long)]
+    file: Option<PathBuf>,
 
     /// Skip nix eval verification after writes
     #[arg(long)]
@@ -69,6 +69,109 @@ pub fn find_flake_root(file_path: &Path) -> Option<PathBuf> {
         }
         dir = dir.parent()?;
     }
+}
+
+/// Walk up from a directory looking for flake.nix.
+pub fn find_flake_root_from_dir(dir: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(dir).ok()?;
+    let mut d = canonical.as_path();
+    loop {
+        if d.join("flake.nix").is_file() {
+            return Some(d.to_path_buf());
+        }
+        d = d.parent()?;
+    }
+}
+
+/// Run `nix eval` with `--apply` and `--raw` to extract the file path from a
+/// `definitionsWithLocations` attribute.
+fn nix_eval_definition_file(flake_dir: &Path, attr: &str) -> Result<String> {
+    let flake_ref = format!("path:{}#{}", flake_dir.display(), attr);
+    let output = Command::new("nix")
+        .args([
+            "eval",
+            &flake_ref,
+            "--apply",
+            "defs: (builtins.head defs).file",
+            "--raw",
+            "--no-warn-dirty",
+        ])
+        .output()
+        .context("failed to run nix eval for option discovery")?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("nix eval failed for {attr}:\n{stderr}")
+    }
+}
+
+/// Convert a Nix store path to a real filesystem path relative to the flake
+/// directory.  Store paths look like `/nix/store/<hash>-source/subdir/file.nix`;
+/// we strip the store prefix and join with `flake_dir`.
+fn store_path_to_real_path(store_file: &str, flake_dir: &Path) -> PathBuf {
+    if let Some(rest) = store_file.strip_prefix("/nix/store/") {
+        // Skip the <hash>-<name> component
+        if let Some(slash_pos) = rest.find('/') {
+            let relative = &rest[slash_pos + 1..];
+            return flake_dir.join(relative);
+        }
+    }
+    // Fallback: assume it's already a real path
+    PathBuf::from(store_file)
+}
+
+/// Discover the file that defines inventory options by evaluating
+/// `definitionsWithLocations` from the flake outputs.
+///
+/// Tries `clanOptions.inventory.definitionsWithLocations` (non-flake-parts)
+/// first, then `clan.options.inventory.definitionsWithLocations` (flake-parts).
+fn discover_file(flake_dir: &Path) -> Result<PathBuf> {
+    // Try non-flake-parts
+    if let Ok(file) =
+        nix_eval_definition_file(flake_dir, "clanOptions.inventory.definitionsWithLocations")
+    {
+        return Ok(store_path_to_real_path(&file, flake_dir));
+    }
+
+    // Try flake-parts
+    if let Ok(file) =
+        nix_eval_definition_file(flake_dir, "clan.options.inventory.definitionsWithLocations")
+    {
+        return Ok(store_path_to_real_path(&file, flake_dir));
+    }
+
+    bail!(
+        "clanOptions not exposed in flake outputs. \
+         Add `clanOptions = clan.options;` to your flake.nix outputs."
+    )
+}
+
+/// Resolve the target file to edit: use `-f` if provided, otherwise attempt
+/// option discovery, falling back to `clan.nix`.
+fn resolve_file(explicit_file: Option<&Path>, flake_override: Option<&Path>) -> Result<PathBuf> {
+    if let Some(f) = explicit_file {
+        return Ok(f.to_path_buf());
+    }
+
+    // Try discovery
+    let cwd = std::env::current_dir().context("cannot get current directory")?;
+    let flake_dir = flake_override
+        .map(|p| p.to_path_buf())
+        .or_else(|| find_flake_root_from_dir(&cwd));
+
+    if let Some(flake_dir) = flake_dir {
+        match discover_file(&flake_dir) {
+            Ok(path) => return Ok(path),
+            Err(_) => {
+                // Discovery failed; fall back to default
+            }
+        }
+    }
+
+    // Default
+    Ok(PathBuf::from("clan.nix"))
 }
 
 /// Map a clan.nix attribute path to the corresponding flake output path under
@@ -173,23 +276,31 @@ fn write_and_verify(
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let flake_override = cli.flake.as_deref();
+    let file = resolve_file(cli.file.as_deref(), flake_override)?;
 
     match &cli.command {
         Commands::Get { path } => {
-            let source = read_file(&cli.file)?;
+            let source = read_file(&file)?;
             let root = ast::parse_nix(&source)?;
             let value = ast::get_attr(&root, path)?;
             println!("{value}");
         }
         Commands::Set { path, value } => {
-            let source = read_file(&cli.file)?;
+            let source = read_file(&file)?;
             let result = ast::set_attr(&source, path, value)?;
-            write_and_verify(&cli.file, &result, &source, cli.no_verify, flake_override, Some(path))?;
+            write_and_verify(
+                &file,
+                &result,
+                &source,
+                cli.no_verify,
+                flake_override,
+                Some(path),
+            )?;
         }
         Commands::Delete { path } => {
-            let source = read_file(&cli.file)?;
+            let source = read_file(&file)?;
             let result = ast::delete_attr(&source, path)?;
-            write_and_verify(&cli.file, &result, &source, cli.no_verify, flake_override, None)?;
+            write_and_verify(&file, &result, &source, cli.no_verify, flake_override, None)?;
         }
     }
 
@@ -227,12 +338,82 @@ mod tests {
     fn test_map_to_inventory_path() {
         // Standard clan.nix paths
         assert_eq!(map_to_inventory_path("meta.name"), "meta.name");
-        assert_eq!(map_to_inventory_path("inventory.machines.test"), "machines.test");
-        assert_eq!(map_to_inventory_path("inventory.instances.sshd"), "instances.sshd");
+        assert_eq!(
+            map_to_inventory_path("inventory.machines.test"),
+            "machines.test"
+        );
+        assert_eq!(
+            map_to_inventory_path("inventory.instances.sshd"),
+            "instances.sshd"
+        );
 
         // Flake-parts paths (clan. prefix)
         assert_eq!(map_to_inventory_path("clan.meta.name"), "meta.name");
-        assert_eq!(map_to_inventory_path("clan.inventory.machines.test"), "machines.test");
+        assert_eq!(
+            map_to_inventory_path("clan.inventory.machines.test"),
+            "machines.test"
+        );
+    }
+
+    #[test]
+    fn test_store_path_to_real_path() {
+        let flake_dir = Path::new("/home/user/project");
+
+        // Normal store path
+        let store = "/nix/store/abc123-source/clan.nix";
+        assert_eq!(
+            store_path_to_real_path(store, flake_dir),
+            PathBuf::from("/home/user/project/clan.nix")
+        );
+
+        // Store path with subdirectory
+        let store = "/nix/store/abc123-source/config/inventory.nix";
+        assert_eq!(
+            store_path_to_real_path(store, flake_dir),
+            PathBuf::from("/home/user/project/config/inventory.nix")
+        );
+
+        // Already a real path (fallback)
+        let real = "/home/user/project/clan.nix";
+        assert_eq!(
+            store_path_to_real_path(real, flake_dir),
+            PathBuf::from("/home/user/project/clan.nix")
+        );
+    }
+
+    #[test]
+    fn test_discover_file_error_message() {
+        // When clanOptions is not exposed, discover_file should return a
+        // helpful error message
+        let tmpdir = tempfile::tempdir().unwrap();
+        // Create a minimal flake that does NOT expose clanOptions
+        fs::write(
+            tmpdir.path().join("flake.nix"),
+            r#"{ outputs = { self, ... }: { }; }"#,
+        )
+        .unwrap();
+
+        // Initialize git repo (required for flakes)
+        let _ = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(tmpdir.path())
+            .output();
+        let _ = Command::new("git")
+            .args(["add", "."])
+            .current_dir(tmpdir.path())
+            .output();
+
+        let result = discover_file(tmpdir.path());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("clanOptions not exposed"),
+            "expected clanOptions error, got: {msg}"
+        );
+        assert!(
+            msg.contains("clanOptions = clan.options"),
+            "expected hint about adding clanOptions, got: {msg}"
+        );
     }
 
     #[test]

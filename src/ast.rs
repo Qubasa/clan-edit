@@ -22,28 +22,160 @@ pub fn print_nix(root: &rnix::Root) -> String {
     root.syntax().to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Expression classification
+// ---------------------------------------------------------------------------
+
+/// Classification of a Nix expression node.
+#[derive(Debug)]
+pub enum ExprKind {
+    /// A plain attribute set `{ ... }`
+    AttrSet,
+    /// `lib.mkDefault value` or `mkDefault value`
+    MkDefault,
+    /// `lib.mkForce value` or `mkForce value`
+    MkForce,
+    /// The `//` merge/update operator
+    MergeOperator,
+    /// A function application (not mkDefault/mkForce)
+    FunctionApplication,
+    /// A `let ... in ...` expression
+    LetIn,
+    /// A lambda `x: body` or `{ ... }: body`
+    Lambda,
+    /// Anything else (literals, lists, strings, etc.)
+    Other,
+}
+
+/// Classify a Nix expression node.
+pub fn classify_expr(node: &rnix::SyntaxNode) -> ExprKind {
+    if rnix::ast::AttrSet::cast(node.clone()).is_some() {
+        return ExprKind::AttrSet;
+    }
+
+    if let Some(apply) = rnix::ast::Apply::cast(node.clone()) {
+        if let Some(wrapper_kind) = detect_mk_wrapper_kind(&apply) {
+            return wrapper_kind;
+        }
+        return ExprKind::FunctionApplication;
+    }
+
+    if let Some(binop) = rnix::ast::BinOp::cast(node.clone()) {
+        if matches!(binop.operator(), Some(rnix::ast::BinOpKind::Update)) {
+            return ExprKind::MergeOperator;
+        }
+        return ExprKind::Other;
+    }
+
+    if rnix::ast::LetIn::cast(node.clone()).is_some() {
+        return ExprKind::LetIn;
+    }
+
+    if rnix::ast::Lambda::cast(node.clone()).is_some() {
+        return ExprKind::Lambda;
+    }
+
+    ExprKind::Other
+}
+
+/// Check if an Apply node is `lib.mkDefault`, `lib.mkForce`, `mkDefault`, or
+/// `mkForce`.  Returns the matching `ExprKind` variant if recognized.
+fn detect_mk_wrapper_kind(apply: &rnix::ast::Apply) -> Option<ExprKind> {
+    let func = apply.lambda()?;
+    let func_name = match &func {
+        rnix::ast::Expr::Select(select) => {
+            // lib.mkDefault or lib.mkForce
+            let base = select.expr()?;
+            if let rnix::ast::Expr::Ident(ident) = base {
+                if ident.ident_token()?.text() != "lib" {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+            let attrpath = select.attrpath()?;
+            let attrs: Vec<String> = attrpath
+                .attrs()
+                .filter_map(|a| attr_to_string(&a))
+                .collect();
+            if attrs.len() != 1 {
+                return None;
+            }
+            attrs.into_iter().next()?
+        }
+        rnix::ast::Expr::Ident(ident) => {
+            // mkDefault or mkForce (bare, e.g. via `with lib;`)
+            ident.ident_token()?.text().to_string()
+        }
+        _ => return None,
+    };
+
+    match func_name.as_str() {
+        "mkDefault" => Some(ExprKind::MkDefault),
+        "mkForce" => Some(ExprKind::MkForce),
+        _ => None,
+    }
+}
+
+/// If `node` is a recognized mkDefault/mkForce Apply, return the inner (argument)
+/// value node.
+pub fn unwrap_mk_wrapper(node: &rnix::SyntaxNode) -> Option<rnix::SyntaxNode> {
+    let apply = rnix::ast::Apply::cast(node.clone())?;
+    let kind = detect_mk_wrapper_kind(&apply)?;
+    match kind {
+        ExprKind::MkDefault | ExprKind::MkForce => {
+            let arg = apply.argument()?;
+            Some(arg.syntax().clone())
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Attribute path lookup
+// ---------------------------------------------------------------------------
+
 /// Represents the result of looking up an attribute path in a Nix attrset.
 pub struct AttrLookup {
     /// The syntax node of the value (right-hand side of the binding).
+    /// For mkDefault/mkForce, this is the INNER value (unwrapped).
     pub value_node: rnix::SyntaxNode,
     /// The full binding node (`key = value;`).
     pub binding_node: rnix::SyntaxNode,
+    /// If the value was wrapped in mkDefault/mkForce, this is the full Apply
+    /// node.  `set_attr` uses this to replace only the inner value.
+    pub wrapper_node: Option<rnix::SyntaxNode>,
+}
+
+/// Result of an attribute-path lookup operation.
+pub enum LookupResult {
+    /// Found the attribute at the exact path.
+    Found(AttrLookup),
+    /// Attribute path not found (no matching bindings).
+    NotFound,
+    /// A prefix matched but the value is a complex expression that cannot be
+    /// navigated into.
+    Blocked { path: String, reason: String },
 }
 
 /// Navigate to an attribute path in the root expression.
 ///
-/// Supports both nested forms (`a = { b = x; }`) and dotted key forms (`a.b = x`).
-/// The root expression must be an attribute set (possibly with `let ... in { ... }`).
-///
-/// Returns the value node and binding node at the given path, or None if not found.
-pub fn lookup_attr_path(root: &rnix::Root, path: &[&str]) -> Option<AttrLookup> {
-    let expr = root.expr()?;
-    let attrset = find_root_attrset(&expr)?;
-    lookup_in_attrset(attrset.syntax(), path)
+/// Supports both nested forms (`a = { b = x; }`) and dotted key forms
+/// (`a.b = x`).  The root expression must be an attribute set (possibly with
+/// `let ... in { ... }` or a lambda wrapper).
+pub fn lookup_attr_path(root: &rnix::Root, path: &[&str]) -> LookupResult {
+    let Some(expr) = root.expr() else {
+        return LookupResult::NotFound;
+    };
+    let Some(attrset) = find_root_attrset(&expr) else {
+        return LookupResult::NotFound;
+    };
+    lookup_in_attrset(attrset.syntax(), path, path)
 }
 
 /// Find the root attribute set from the top-level expression,
-/// handling `let ... in { ... }`, `{ ... }`, and `{ ... }: { ... }` (lambda) forms.
+/// handling `let ... in { ... }`, `{ ... }`, and `{ ... }: { ... }` (lambda)
+/// forms.
 fn find_root_attrset(expr: &rnix::ast::Expr) -> Option<rnix::ast::AttrSet> {
     match expr {
         rnix::ast::Expr::AttrSet(attrset) => Some(attrset.clone()),
@@ -60,18 +192,28 @@ fn find_root_attrset(expr: &rnix::ast::Expr) -> Option<rnix::ast::AttrSet> {
 }
 
 /// Recursively look up an attribute path within an attrset syntax node.
-fn lookup_in_attrset(attrset_node: &rnix::SyntaxNode, path: &[&str]) -> Option<AttrLookup> {
+///
+/// `full_path` is the complete original path (used for error messages).
+/// `path` is the remaining path to resolve at this level.
+fn lookup_in_attrset(
+    attrset_node: &rnix::SyntaxNode,
+    path: &[&str],
+    full_path: &[&str],
+) -> LookupResult {
     if path.is_empty() {
-        return None;
+        return LookupResult::NotFound;
     }
 
-    // Iterate over all bindings (HasEntry items) in this attrset
     for child in attrset_node.children() {
         if child.kind() != SyntaxKind::NODE_ATTRPATH_VALUE {
             continue;
         }
-        let binding: rnix::ast::AttrpathValue = AstNode::cast(child.clone())?;
-        let attrpath = binding.attrpath()?;
+        let Some(binding) = <rnix::ast::AttrpathValue as AstNode>::cast(child.clone()) else {
+            continue;
+        };
+        let Some(attrpath) = binding.attrpath() else {
+            continue;
+        };
         let keys: Vec<String> = attrpath
             .attrs()
             .filter_map(|attr| attr_to_string(&attr))
@@ -81,31 +223,228 @@ fn lookup_in_attrset(attrset_node: &rnix::SyntaxNode, path: &[&str]) -> Option<A
             continue;
         }
 
-        // Check if this binding's key path matches the beginning of our target path
-        let target = path;
-
-        if keys.len() <= target.len() && keys.iter().zip(target.iter()).all(|(a, b)| a == b) {
-            let remaining = &target[keys.len()..];
+        // Check if this binding's key path matches the beginning of our
+        // target path.
+        if keys.len() <= path.len() && keys.iter().zip(path.iter()).all(|(a, b)| a == b) {
+            let remaining = &path[keys.len()..];
 
             if remaining.is_empty() {
-                // Exact match - return this binding's value
-                let value = binding.value()?;
-                return Some(AttrLookup {
-                    value_node: value.syntax().clone(),
+                // --- Exact match -----------------------------------------
+                let Some(value_expr) = binding.value() else {
+                    continue;
+                };
+                let value_node = value_expr.syntax().clone();
+
+                // Unwrap mkDefault/mkForce
+                if let Some(inner) = unwrap_mk_wrapper(&value_node) {
+                    return LookupResult::Found(AttrLookup {
+                        value_node: inner,
+                        binding_node: child,
+                        wrapper_node: Some(value_node),
+                    });
+                }
+
+                return LookupResult::Found(AttrLookup {
+                    value_node,
                     binding_node: child,
+                    wrapper_node: None,
                 });
             }
 
-            // We matched a prefix; look deeper into the value if it's an attrset
-            let value = binding.value()?;
-            if let rnix::ast::Expr::AttrSet(inner) = value {
-                return lookup_in_attrset(inner.syntax(), remaining);
+            // --- Prefix match – navigate deeper -------------------------
+            let Some(value_expr) = binding.value() else {
+                continue;
+            };
+            let value_node = value_expr.syntax().clone();
+
+            match classify_expr(&value_node) {
+                ExprKind::AttrSet => {
+                    if let Some(inner) = rnix::ast::AttrSet::cast(value_node) {
+                        return lookup_in_attrset(inner.syntax(), remaining, full_path);
+                    }
+                }
+                ExprKind::MkDefault | ExprKind::MkForce => {
+                    if let Some(inner) = unwrap_mk_wrapper(&value_node) {
+                        if let Some(inner_attrset) = rnix::ast::AttrSet::cast(inner.clone()) {
+                            return lookup_in_attrset(inner_attrset.syntax(), remaining, full_path);
+                        }
+                        // Inner value is not an attrset
+                        let consumed = full_path.len() - remaining.len();
+                        return LookupResult::Blocked {
+                            path: full_path[..consumed].join("."),
+                            reason: "value inside mkDefault/mkForce is not an attribute set"
+                                .to_string(),
+                        };
+                    }
+                }
+                ExprKind::MergeOperator => {
+                    let consumed = full_path.len() - remaining.len();
+                    return LookupResult::Blocked {
+                        path: full_path[..consumed].join("."),
+                        reason:
+                            "value uses merge operator (//). clan-edit cannot safely modify values constructed with //."
+                                .to_string(),
+                    };
+                }
+                ExprKind::FunctionApplication => {
+                    let consumed = full_path.len() - remaining.len();
+                    return LookupResult::Blocked {
+                        path: full_path[..consumed].join("."),
+                        reason:
+                            "value is a function application. clan-edit can only navigate into plain attribute sets."
+                                .to_string(),
+                    };
+                }
+                ExprKind::LetIn => {
+                    let consumed = full_path.len() - remaining.len();
+                    return LookupResult::Blocked {
+                        path: full_path[..consumed].join("."),
+                        reason:
+                            "value is a let-in expression. clan-edit cannot navigate into let-in bodies."
+                                .to_string(),
+                    };
+                }
+                ExprKind::Lambda => {
+                    let consumed = full_path.len() - remaining.len();
+                    return LookupResult::Blocked {
+                        path: full_path[..consumed].join("."),
+                        reason:
+                            "value is a function/lambda. clan-edit can only navigate into plain attribute sets."
+                                .to_string(),
+                    };
+                }
+                ExprKind::Other => {
+                    // Can't navigate into literals, lists, etc. – not an
+                    // error, just not found.
+                }
             }
         }
     }
 
-    None
+    LookupResult::NotFound
 }
+
+// ---------------------------------------------------------------------------
+// Intermediate path collection (for paths that span multiple dotted-key
+// bindings but have no single binding of their own).
+// ---------------------------------------------------------------------------
+
+/// Collect all bindings in `attrset_node` whose key path starts with `prefix`.
+/// Returns (remaining_keys, value_source_text) pairs.
+fn collect_prefix_bindings(
+    attrset_node: &rnix::SyntaxNode,
+    prefix: &[&str],
+) -> Vec<(Vec<String>, String)> {
+    let mut results = Vec::new();
+
+    for child in attrset_node.children() {
+        if child.kind() != SyntaxKind::NODE_ATTRPATH_VALUE {
+            continue;
+        }
+        let Some(binding) = <rnix::ast::AttrpathValue as AstNode>::cast(child.clone()) else {
+            continue;
+        };
+        let Some(attrpath) = binding.attrpath() else {
+            continue;
+        };
+        let keys: Vec<String> = attrpath
+            .attrs()
+            .filter_map(|attr| attr_to_string(&attr))
+            .collect();
+
+        if keys.len() > prefix.len()
+            && keys[..prefix.len()]
+                .iter()
+                .zip(prefix.iter())
+                .all(|(a, b)| a == b)
+        {
+            let remaining: Vec<String> = keys[prefix.len()..].to_vec();
+            if let Some(value) = binding.value() {
+                results.push((remaining, value.syntax().to_string()));
+            }
+        }
+    }
+
+    results
+}
+
+/// Navigate to the attrset containing `path` and collect prefix bindings
+/// from there.  This is the entry-point used by `get_attr` when an exact
+/// lookup returns `NotFound`.
+fn collect_prefix_bindings_recursive(
+    root: &rnix::Root,
+    full_path: &[&str],
+) -> Vec<(Vec<String>, String)> {
+    let Some(expr) = root.expr() else {
+        return Vec::new();
+    };
+    let Some(attrset) = find_root_attrset(&expr) else {
+        return Vec::new();
+    };
+    collect_prefix_in_attrset(attrset.syntax(), full_path)
+}
+
+/// Navigate as deep as possible along `path`, then collect prefix bindings for
+/// the remaining path segments.
+fn collect_prefix_in_attrset(
+    attrset_node: &rnix::SyntaxNode,
+    path: &[&str],
+) -> Vec<(Vec<String>, String)> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+
+    // Try to navigate deeper first
+    for child in attrset_node.children() {
+        if child.kind() != SyntaxKind::NODE_ATTRPATH_VALUE {
+            continue;
+        }
+        let Some(binding) = <rnix::ast::AttrpathValue as AstNode>::cast(child.clone()) else {
+            continue;
+        };
+        let Some(attrpath) = binding.attrpath() else {
+            continue;
+        };
+        let keys: Vec<String> = attrpath
+            .attrs()
+            .filter_map(|attr| attr_to_string(&attr))
+            .collect();
+
+        if keys.is_empty() {
+            continue;
+        }
+
+        if keys.len() <= path.len() && keys.iter().zip(path.iter()).all(|(a, b)| a == b) {
+            let remaining = &path[keys.len()..];
+            if remaining.is_empty() {
+                // Exact match for this binding – caller should have found it
+                // via normal lookup.  Nothing to collect here.
+                return Vec::new();
+            }
+
+            // Try descending into the value
+            if let Some(value) = binding.value() {
+                if let rnix::ast::Expr::AttrSet(inner) = value {
+                    return collect_prefix_in_attrset(inner.syntax(), remaining);
+                }
+                // Try unwrapping mkDefault/mkForce
+                if let Some(inner) = unwrap_mk_wrapper(value.syntax()) {
+                    if let Some(inner_attrset) = rnix::ast::AttrSet::cast(inner) {
+                        return collect_prefix_in_attrset(inner_attrset.syntax(), remaining);
+                    }
+                }
+            }
+            return Vec::new();
+        }
+    }
+
+    // Could not navigate further — collect prefix bindings at this level
+    collect_prefix_bindings(attrset_node, path)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /// Convert an Attr AST node to a string key name.
 fn attr_to_string(attr: &rnix::ast::Attr) -> Option<String> {
@@ -123,12 +462,54 @@ fn attr_to_string(attr: &rnix::ast::Attr) -> Option<String> {
     }
 }
 
+/// Format an attribute key, quoting it if it contains special characters.
+fn format_attr_key(key: &str) -> String {
+    if key
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        && !key.is_empty()
+        && key
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+    {
+        // Simple identifiers can stay unquoted; hyphens are valid in Nix idents
+        key.to_string()
+    } else {
+        format!("\"{key}\"")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 /// Get the Nix source text of the value at the given attribute path.
 pub fn get_attr(root: &rnix::Root, path_str: &str) -> Result<String> {
     let parts: Vec<&str> = path_str.split('.').collect();
     match lookup_attr_path(root, &parts) {
-        Some(lookup) => Ok(lookup.value_node.to_string()),
-        None => bail!("attribute path not found: {path_str}"),
+        LookupResult::Found(lookup) => Ok(lookup.value_node.to_string()),
+        LookupResult::Blocked { path, reason } => {
+            bail!("cannot navigate into expression at '{path}': {reason}")
+        }
+        LookupResult::NotFound => {
+            // Try intermediate path reconstruction
+            let bindings = collect_prefix_bindings_recursive(root, &parts);
+            if bindings.is_empty() {
+                bail!("attribute path not found: {path_str}")
+            }
+            let mut result = String::from("{\n");
+            for (remaining_keys, value_text) in &bindings {
+                let key = remaining_keys
+                    .iter()
+                    .map(|k| format_attr_key(k))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                result.push_str(&format!("  {key} = {value_text};\n"));
+            }
+            result.push('}');
+            Ok(result)
+        }
     }
 }
 
@@ -143,8 +524,10 @@ pub fn set_attr(source: &str, path_str: &str, value_str: &str) -> Result<String>
     let parts: Vec<&str> = path_str.split('.').collect();
 
     match lookup_attr_path(&root, &parts) {
-        Some(lookup) => {
-            // Replace existing value
+        LookupResult::Found(lookup) => {
+            // Replace the value.  For mk-wrapped values this replaces just
+            // the inner value, preserving the wrapper (since value_node
+            // points to the unwrapped argument).
             let old_range = lookup.value_node.text_range();
             let start: usize = old_range.start().into();
             let end: usize = old_range.end().into();
@@ -154,14 +537,64 @@ pub fn set_attr(source: &str, path_str: &str, value_str: &str) -> Result<String>
             result.push_str(&source[end..]);
             Ok(result)
         }
-        None => {
+        LookupResult::Blocked { path, reason } => {
+            bail!("cannot navigate into expression at '{path}': {reason}")
+        }
+        LookupResult::NotFound => {
             // Find the deepest existing ancestor and insert there
             insert_attr(source, &root, &parts, value_str)
         }
     }
 }
 
-/// Insert a new attribute binding by finding the deepest existing ancestor attrset.
+/// Delete the attribute at the given path.
+/// Returns the modified source as a string.
+pub fn delete_attr(source: &str, path_str: &str) -> Result<String> {
+    let root = parse_nix(source)?;
+    let parts: Vec<&str> = path_str.split('.').collect();
+
+    match lookup_attr_path(&root, &parts) {
+        LookupResult::Found(lookup) => {
+            let binding = &lookup.binding_node;
+            let start: usize = binding.text_range().start().into();
+            let end: usize = binding.text_range().end().into();
+
+            // Include the semicolon after the binding if present
+            let after_binding = &source[end..];
+            let extra = if after_binding.starts_with(';') { 1 } else { 0 };
+
+            // Also consume leading whitespace (back to the previous newline)
+            let before_binding = &source[..start];
+            let leading_ws = before_binding
+                .rfind('\n')
+                .map(|pos| start - pos - 1)
+                .unwrap_or(0);
+
+            let trim_start = start - leading_ws;
+            let trim_end = end + extra;
+
+            // Also eat a trailing newline if present
+            let after_trim = &source[trim_end..];
+            let trailing_nl = if after_trim.starts_with('\n') { 1 } else { 0 };
+
+            let mut result = String::with_capacity(source.len());
+            result.push_str(&source[..trim_start]);
+            result.push_str(&source[trim_end + trailing_nl..]);
+            Ok(result)
+        }
+        LookupResult::Blocked { path, reason } => {
+            bail!("cannot navigate into expression at '{path}': {reason}")
+        }
+        LookupResult::NotFound => bail!("attribute path not found: {path_str}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Insertion helpers
+// ---------------------------------------------------------------------------
+
+/// Insert a new attribute binding by finding the deepest existing ancestor
+/// attrset.
 fn insert_attr(source: &str, root: &rnix::Root, path: &[&str], value_str: &str) -> Result<String> {
     let expr = root.expr().context("file has no top-level expression")?;
     let root_attrset =
@@ -195,24 +628,6 @@ fn insert_attr(source: &str, root: &rnix::Root, path: &[&str], value_str: &str) 
     result.push('\n');
     result.push_str(&source[insert_pos..]);
     Ok(result)
-}
-
-/// Format an attribute key, quoting it if it contains special characters.
-fn format_attr_key(key: &str) -> String {
-    if key
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
-        && !key.is_empty()
-        && key
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_alphabetic() || c == '_')
-    {
-        // Simple identifiers can stay unquoted; hyphens are valid in Nix idents
-        key.to_string()
-    } else {
-        format!("\"{key}\"")
-    }
 }
 
 /// Find the deepest ancestor attrset that exists along the given path.
@@ -253,6 +668,14 @@ fn find_deepest_ancestor<'a>(
             if let Some(rnix::ast::Expr::AttrSet(inner)) = binding.value() {
                 return find_deepest_ancestor(inner.syntax(), remaining);
             }
+            // Try unwrapping mkDefault/mkForce
+            if let Some(value) = binding.value() {
+                if let Some(inner) = unwrap_mk_wrapper(value.syntax()) {
+                    if let Some(inner_attrset) = rnix::ast::AttrSet::cast(inner) {
+                        return find_deepest_ancestor(inner_attrset.syntax(), remaining);
+                    }
+                }
+            }
             // Value exists but isn't an attrset - can't descend further
             return (attrset_node.clone(), path);
         }
@@ -263,7 +686,6 @@ fn find_deepest_ancestor<'a>(
 
 /// Find the byte position just before the closing `}` of an attrset node.
 fn find_insert_position(node: &rnix::SyntaxNode) -> usize {
-    // Look for the closing brace token - collect to vec since iterator doesn't support rev
     let mut last_brace_pos = None;
     for child in node.children_with_tokens() {
         if let rowan::NodeOrToken::Token(token) = child {
@@ -272,7 +694,6 @@ fn find_insert_position(node: &rnix::SyntaxNode) -> usize {
             }
         }
     }
-    // Return the position of the last closing brace, or the end of the node
     last_brace_pos.unwrap_or_else(|| node.text_range().end().into())
 }
 
@@ -292,44 +713,9 @@ fn detect_indent(node: &rnix::SyntaxNode) -> String {
     "\n  ".to_string()
 }
 
-/// Delete the attribute at the given path.
-/// Returns the modified source as a string.
-pub fn delete_attr(source: &str, path_str: &str) -> Result<String> {
-    let root = parse_nix(source)?;
-    let parts: Vec<&str> = path_str.split('.').collect();
-
-    match lookup_attr_path(&root, &parts) {
-        Some(lookup) => {
-            let binding = &lookup.binding_node;
-            let start: usize = binding.text_range().start().into();
-            let end: usize = binding.text_range().end().into();
-
-            // Include the semicolon after the binding if present
-            let after_binding = &source[end..];
-            let extra = if after_binding.starts_with(';') { 1 } else { 0 };
-
-            // Also consume leading whitespace (back to the previous newline)
-            let before_binding = &source[..start];
-            let leading_ws = before_binding
-                .rfind('\n')
-                .map(|pos| start - pos - 1)
-                .unwrap_or(0);
-
-            let trim_start = start - leading_ws;
-            let trim_end = end + extra;
-
-            // Also eat a trailing newline if present
-            let after_trim = &source[trim_end..];
-            let trailing_nl = if after_trim.starts_with('\n') { 1 } else { 0 };
-
-            let mut result = String::with_capacity(source.len());
-            result.push_str(&source[..trim_start]);
-            result.push_str(&source[trim_end + trailing_nl..]);
-            Ok(result)
-        }
-        None => bail!("attribute path not found: {path_str}"),
-    }
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -495,7 +881,12 @@ mod tests {
         assert_eq!(val.trim(), "{ }");
 
         // Set a sub-path on the dashed key
-        let result = set_attr(source, "inventory.machines.my-server.deploy.targetHost", "\"10.0.0.1\"").unwrap();
+        let result = set_attr(
+            source,
+            "inventory.machines.my-server.deploy.targetHost",
+            "\"10.0.0.1\"",
+        )
+        .unwrap();
         assert!(result.contains("my-server"));
         assert!(result.contains("10.0.0.1"));
 
@@ -523,8 +914,12 @@ mod tests {
         assert!(val.contains("commonKey"));
         assert!(val.contains("module.name"));
 
-        // Cannot navigate INTO the let...in body
-        assert!(get_attr(&root, "inventory.instances.sshd.module.name").is_err());
+        // Cannot navigate INTO the let...in body — now gives a descriptive error
+        let err = get_attr(&root, "inventory.instances.sshd.module.name").unwrap_err();
+        assert!(
+            err.to_string().contains("let-in"),
+            "expected let-in error, got: {err}"
+        );
     }
 
     #[test]
@@ -537,7 +932,12 @@ mod tests {
     module.name = "sshd";
   };
 }"#;
-        let result = set_attr(source, "inventory.instances.sshd", "{ module.name = \"sshd\"; roles.server.tags.all = { }; }").unwrap();
+        let result = set_attr(
+            source,
+            "inventory.instances.sshd",
+            "{ module.name = \"sshd\"; roles.server.tags.all = { }; }",
+        )
+        .unwrap();
         assert!(!result.contains("let"));
         assert!(result.contains("roles.server.tags.all"));
     }
@@ -561,5 +961,292 @@ mod tests {
         let root = parse_nix(source).unwrap();
         let output = print_nix(&root);
         assert_eq!(source, output);
+    }
+
+    // -----------------------------------------------------------------------
+    // Expression classification tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_attrset() {
+        let root = parse_nix(r#"{ a = { x = 1; }; }"#).unwrap();
+        let _val = get_attr(&root, "a").unwrap();
+        // Verify it's navigable
+        let val2 = get_attr(&root, "a.x").unwrap();
+        assert_eq!(val2.trim(), "1");
+    }
+
+    #[test]
+    fn test_classify_merge_operator() {
+        let source = r#"{ a = { x = 1; } // { y = 2; }; }"#;
+        let root = parse_nix(source).unwrap();
+
+        // Getting the whole value works
+        let val = get_attr(&root, "a").unwrap();
+        assert!(val.contains("//"));
+
+        // Navigating into it fails with a descriptive error
+        let err = get_attr(&root, "a.x").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("merge operator"),
+            "expected merge error, got: {msg}"
+        );
+        assert!(msg.contains("//"), "expected // in error, got: {msg}");
+    }
+
+    #[test]
+    fn test_classify_function_application() {
+        let source = r#"{ a = someFunc { x = 1; }; }"#;
+        let root = parse_nix(source).unwrap();
+
+        // Getting the whole value works
+        let val = get_attr(&root, "a").unwrap();
+        assert!(val.contains("someFunc"));
+
+        // Navigating into it fails
+        let err = get_attr(&root, "a.x").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("function application"),
+            "expected function application error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_lambda() {
+        let source = r#"{ a = x: { name = x; }; }"#;
+        let root = parse_nix(source).unwrap();
+
+        // Navigating into lambda fails
+        let err = get_attr(&root, "a.name").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("function/lambda"),
+            "expected lambda error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_classify_let_in() {
+        let source = r#"{ a = let x = 1; in { y = x; }; }"#;
+        let root = parse_nix(source).unwrap();
+
+        let err = get_attr(&root, "a.y").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("let-in"), "expected let-in error, got: {msg}");
+    }
+
+    // -----------------------------------------------------------------------
+    // mkDefault / mkForce tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_mkdefault_unwraps() {
+        let source = r#"{ meta.name = lib.mkDefault "MyClan"; }"#;
+        let root = parse_nix(source).unwrap();
+        let val = get_attr(&root, "meta.name").unwrap();
+        assert_eq!(val, "\"MyClan\"");
+    }
+
+    #[test]
+    fn test_get_mkforce_unwraps() {
+        let source = r#"{ meta.name = lib.mkForce "ForcedClan"; }"#;
+        let root = parse_nix(source).unwrap();
+        let val = get_attr(&root, "meta.name").unwrap();
+        assert_eq!(val, "\"ForcedClan\"");
+    }
+
+    #[test]
+    fn test_get_bare_mkdefault_unwraps() {
+        let source = r#"{ meta.name = mkDefault "MyClan"; }"#;
+        let root = parse_nix(source).unwrap();
+        let val = get_attr(&root, "meta.name").unwrap();
+        assert_eq!(val, "\"MyClan\"");
+    }
+
+    #[test]
+    fn test_set_preserves_mkdefault_wrapper() {
+        let source = r#"{ meta.name = lib.mkDefault "OldName"; }"#;
+        let result = set_attr(source, "meta.name", "\"NewName\"").unwrap();
+        assert!(
+            result.contains("lib.mkDefault \"NewName\""),
+            "expected lib.mkDefault preserved, got: {result}"
+        );
+        assert!(!result.contains("OldName"));
+    }
+
+    #[test]
+    fn test_set_preserves_mkforce_wrapper() {
+        let source = r#"{ meta.name = lib.mkForce "OldName"; }"#;
+        let result = set_attr(source, "meta.name", "\"NewName\"").unwrap();
+        assert!(
+            result.contains("lib.mkForce \"NewName\""),
+            "expected lib.mkForce preserved, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_navigate_through_mkdefault_attrset() {
+        let source = r#"{ inventory.instances.sshd = lib.mkDefault { module.name = "sshd"; }; }"#;
+        let root = parse_nix(source).unwrap();
+        let val = get_attr(&root, "inventory.instances.sshd.module.name").unwrap();
+        assert_eq!(val, "\"sshd\"");
+    }
+
+    #[test]
+    fn test_set_through_mkdefault_attrset() {
+        let source = r#"{ inventory.instances.sshd = lib.mkDefault { module.name = "sshd"; }; }"#;
+        let result = set_attr(
+            source,
+            "inventory.instances.sshd.module.name",
+            "\"newsshd\"",
+        )
+        .unwrap();
+        assert!(result.contains("lib.mkDefault"));
+        assert!(result.contains("\"newsshd\""));
+        assert!(!result.contains("\"sshd\""));
+    }
+
+    #[test]
+    fn test_other_function_not_unwrapped() {
+        // someTransform is not mkDefault/mkForce, so it's treated as a
+        // function application
+        let source = r#"{ meta.name = someTransform "value"; }"#;
+        let root = parse_nix(source).unwrap();
+
+        // Getting the leaf value returns the full expression
+        let val = get_attr(&root, "meta.name").unwrap();
+        assert!(
+            val.contains("someTransform"),
+            "expected full expr, got: {val}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Intermediate path navigation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_intermediate_path_basic() {
+        let source = r#"{
+  instances.yggdrasil = {
+    module.name = "yggdrasil";
+    roles.default.tags = [ "all" ];
+  };
+}"#;
+        let root = parse_nix(source).unwrap();
+        let val = get_attr(&root, "instances.yggdrasil.roles").unwrap();
+        assert!(
+            val.contains("default.tags"),
+            "expected roles subtree, got: {val}"
+        );
+    }
+
+    #[test]
+    fn test_intermediate_path_multiple_children() {
+        let source = r#"{
+  instances.sshd = {
+    module.name = "sshd";
+    roles.server.tags.all = { };
+    roles.client.tags.all = { };
+  };
+}"#;
+        let root = parse_nix(source).unwrap();
+        let val = get_attr(&root, "instances.sshd.roles").unwrap();
+        assert!(
+            val.contains("server.tags.all"),
+            "expected server, got: {val}"
+        );
+        assert!(
+            val.contains("client.tags.all"),
+            "expected client, got: {val}"
+        );
+    }
+
+    #[test]
+    fn test_intermediate_path_deep() {
+        let source = r#"{
+  instances.sshd = {
+    roles.server.tags.all = { };
+    roles.server.settings.key = "val";
+  };
+}"#;
+        let root = parse_nix(source).unwrap();
+        let val = get_attr(&root, "instances.sshd.roles.server").unwrap();
+        assert!(val.contains("tags.all"), "expected tags.all, got: {val}");
+        assert!(
+            val.contains("settings.key"),
+            "expected settings.key, got: {val}"
+        );
+    }
+
+    #[test]
+    fn test_intermediate_path_not_found() {
+        let source = r#"{ instances.sshd.module.name = "sshd"; }"#;
+        let root = parse_nix(source).unwrap();
+        assert!(get_attr(&root, "instances.sshd.nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_intermediate_path_with_dotted_at_root() {
+        // Both bindings are at the root with dotted keys sharing a prefix
+        let source = r#"{
+  a.b = "hello";
+  a.c = 42;
+}"#;
+        let root = parse_nix(source).unwrap();
+        let val = get_attr(&root, "a").unwrap();
+        assert!(val.contains("b = \"hello\""), "expected b, got: {val}");
+        assert!(val.contains("c = 42"), "expected c, got: {val}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Complex expression error tests (bug report cases)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_merge_operator_blocks_navigation() {
+        let source = r#"{
+  instances.machine-type = {
+    module.input = "self";
+    module.name = "@pinpox/machine-type";
+  } // {
+    foo = "bar";
+  };
+}"#;
+        let root = parse_nix(source).unwrap();
+
+        // Getting the whole value works
+        let val = get_attr(&root, "instances.machine-type").unwrap();
+        assert!(val.contains("//"));
+
+        // Navigating into any sub-path fails with merge operator error
+        for subpath in &[
+            "instances.machine-type.foo",
+            "instances.machine-type.module",
+            "instances.machine-type.module.input",
+        ] {
+            let err = get_attr(&root, subpath).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("merge operator"),
+                "path '{subpath}' expected merge error, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_through_merge_fails() {
+        let source = r#"{ a = { x = 1; } // { y = 2; }; }"#;
+        let err = set_attr(source, "a.x", "42").unwrap_err();
+        assert!(err.to_string().contains("merge operator"));
+    }
+
+    #[test]
+    fn test_set_through_function_fails() {
+        let source = r#"{ a = someFunc { x = 1; }; }"#;
+        let err = set_attr(source, "a.x", "42").unwrap_err();
+        assert!(err.to_string().contains("function application"));
     }
 }

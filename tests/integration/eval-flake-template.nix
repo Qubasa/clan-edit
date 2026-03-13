@@ -17,5 +17,6 @@
     in
     {
       clan = clan.config;
+      clanOptions = clan.options;
     };
 }

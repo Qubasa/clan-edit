@@ -83,16 +83,25 @@ pub fn find_flake_root_from_dir(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Run `nix eval` to extract all definition file paths from a
-/// `definitionsWithLocations` attribute.
-fn nix_eval_definition_files(flake_dir: &Path, attr: &str) -> Result<Vec<String>> {
+/// Run `nix eval` to extract definition file paths from a
+/// `definitionsWithLocations` attribute, optionally filtered by sub-path.
+///
+/// When `filter_segments` is empty, returns all definition files.
+/// When non-empty (e.g., `["machines", "jon"]`), only returns files whose
+/// definition value contains those nested keys.
+fn nix_eval_definition_files(
+    flake_dir: &Path,
+    attr: &str,
+    filter_segments: &[&str],
+) -> Result<Vec<String>> {
     let flake_ref = format!("path:{}#{}", flake_dir.display(), attr);
+    let apply_expr = build_definition_filter(filter_segments);
     let output = Command::new("nix")
         .args([
             "eval",
             &flake_ref,
             "--apply",
-            "defs: map (d: d.file) defs",
+            &apply_expr,
             "--json",
             "--no-warn-dirty",
         ])
@@ -108,6 +117,38 @@ fn nix_eval_definition_files(flake_dir: &Path, attr: &str) -> Result<Vec<String>
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("nix eval failed for {attr}:\n{stderr}")
     }
+}
+
+/// Build a Nix `--apply` expression that filters `definitionsWithLocations`
+/// to find definitions containing a specific inventory sub-path.
+///
+/// Given inventory-relative path segments like `["machines", "jon"]`, produces:
+/// ```nix
+/// defs: map (d: d.file) (builtins.filter (d:
+///   builtins.isAttrs d.value
+///   && d.value ? "machines"
+///   && d.value."machines" ? "jon"
+/// ) defs)
+/// ```
+///
+/// With no segments, returns all files (no filtering beyond `isAttrs`).
+fn build_definition_filter(segments: &[&str]) -> String {
+    if segments.is_empty() {
+        return "defs: map (d: d.file) defs".to_string();
+    }
+
+    let mut conditions = vec!["builtins.isAttrs d.value".to_string()];
+    let mut prefix = "d.value".to_string();
+
+    for seg in segments {
+        let escaped = seg.replace('\\', "\\\\").replace('"', "\\\"");
+        let quoted = format!("\"{escaped}\"");
+        conditions.push(format!("{prefix} ? {quoted}"));
+        prefix = format!("{prefix}.{quoted}");
+    }
+
+    let filter_expr = conditions.join(" && ");
+    format!("defs: map (d: d.file) (builtins.filter (d: {filter_expr}) defs)")
 }
 
 /// Convert a Nix store path to a real filesystem path relative to the flake
@@ -138,31 +179,62 @@ fn find_local_definition(files: &[String], flake_dir: &Path) -> Option<PathBuf> 
     None
 }
 
-/// Discover the file that defines inventory options by evaluating
-/// `definitionsWithLocations` from the flake outputs.
+/// Extract the inventory-relative filter segments from an attribute path.
 ///
-/// Tries `clanOptions.inventory.definitionsWithLocations` (non-flake-parts)
-/// first, then `clan.options.inventory.definitionsWithLocations` (flake-parts).
+/// For path-specific discovery, we need the first two segments of the
+/// inventory-relative path (category + item name, e.g., `["machines", "jon"]`).
 ///
-/// From the returned definitions, picks the one that maps to an actual file in
-/// the user's flake directory (skipping clan-core internal modules).
-fn discover_file(flake_dir: &Path) -> Result<PathBuf> {
-    // Try non-flake-parts
-    if let Ok(files) =
-        nix_eval_definition_files(flake_dir, "clanOptions.inventory.definitionsWithLocations")
-    {
-        if let Some(path) = find_local_definition(&files, flake_dir) {
-            return Ok(path);
+/// Returns `None` if the path is too short for meaningful filtering.
+fn inventory_filter_segments(attr_path: &str) -> Option<Vec<String>> {
+    let inv_path = map_to_inventory_path(attr_path);
+    let segments: Vec<&str> = inv_path.split('.').collect();
+    if segments.len() >= 2 {
+        Some(segments[..2].iter().map(|s| s.to_string()).collect())
+    } else {
+        None
+    }
+}
+
+/// Try to discover a file using `definitionsWithLocations` from one of the
+/// known flake output attributes, optionally filtered by sub-path segments.
+fn try_discover(flake_dir: &Path, filter_segments: &[&str]) -> Option<PathBuf> {
+    let attrs = [
+        "clanOptions.inventory.definitionsWithLocations",
+        "clan.options.inventory.definitionsWithLocations",
+    ];
+    for attr in &attrs {
+        if let Ok(files) = nix_eval_definition_files(flake_dir, attr, filter_segments) {
+            if let Some(path) = find_local_definition(&files, flake_dir) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// Discover the file that defines a specific attribute path within the
+/// inventory, or fall back to general discovery.
+///
+/// When `attr_path` is provided and has enough segments (e.g.,
+/// `inventory.machines.jon.deploy.targetHost`), uses `definitionsWithLocations`
+/// with a filter to find the specific file that defines that attribute.
+///
+/// Falls back to unfiltered discovery (any local inventory definition file),
+/// then to a hard error if no options are exposed at all.
+fn discover_file(flake_dir: &Path, attr_path: Option<&str>) -> Result<PathBuf> {
+    // Try path-specific discovery first
+    if let Some(ap) = attr_path {
+        if let Some(segments) = inventory_filter_segments(ap) {
+            let seg_refs: Vec<&str> = segments.iter().map(|s| s.as_str()).collect();
+            if let Some(path) = try_discover(flake_dir, &seg_refs) {
+                return Ok(path);
+            }
         }
     }
 
-    // Try flake-parts
-    if let Ok(files) =
-        nix_eval_definition_files(flake_dir, "clan.options.inventory.definitionsWithLocations")
-    {
-        if let Some(path) = find_local_definition(&files, flake_dir) {
-            return Ok(path);
-        }
+    // Fall back to general (unfiltered) discovery
+    if let Some(path) = try_discover(flake_dir, &[]) {
+        return Ok(path);
     }
 
     bail!(
@@ -172,8 +244,16 @@ fn discover_file(flake_dir: &Path) -> Result<PathBuf> {
 }
 
 /// Resolve the target file to edit: use `-f` if provided, otherwise attempt
-/// option discovery, falling back to `clan.nix`.
-fn resolve_file(explicit_file: Option<&Path>, flake_override: Option<&Path>) -> Result<PathBuf> {
+/// option discovery (path-specific then general), falling back to `clan.nix`.
+///
+/// When `attr_path` is provided, path-specific discovery is attempted first
+/// to find the exact file that defines the target attribute (useful for
+/// multi-file configurations).
+fn resolve_file(
+    explicit_file: Option<&Path>,
+    flake_override: Option<&Path>,
+    attr_path: Option<&str>,
+) -> Result<PathBuf> {
     if let Some(f) = explicit_file {
         return Ok(f.to_path_buf());
     }
@@ -185,7 +265,7 @@ fn resolve_file(explicit_file: Option<&Path>, flake_override: Option<&Path>) -> 
         .or_else(|| find_flake_root_from_dir(&cwd));
 
     if let Some(flake_dir) = &flake_dir {
-        match discover_file(flake_dir) {
+        match discover_file(flake_dir, attr_path) {
             Ok(path) => return Ok(path),
             Err(_) => {
                 // Discovery failed; fall back to clan.nix in flake dir
@@ -299,21 +379,50 @@ fn write_and_verify(
     }
 }
 
+/// Try an attribute path, falling back to stripping the `clan.` prefix.
+///
+/// In flake-parts setups, users specify paths like `clan.inventory.machines.jon`
+/// but imported clan modules use paths without the `clan.` prefix. When a file
+/// is discovered via `definitionsWithLocations`, it might be a plain clan module
+/// where the `clan.` prefix doesn't exist in the AST.
+fn effective_path<'a>(path: &'a str, source: &str) -> &'a str {
+    if let Some(stripped) = path.strip_prefix("clan.") {
+        // Check if the file has a `clan` key at its root — if so, keep the prefix
+        if let Ok(root) = ast::parse_nix(source) {
+            if ast::get_attr(&root, "clan").is_err() {
+                return stripped;
+            }
+        }
+    }
+    path
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let flake_override = cli.flake.as_deref();
-    let file = resolve_file(cli.file.as_deref(), flake_override)?;
+
+    // Extract the attribute path for commands that have one, used for
+    // path-specific file discovery in multi-file configurations.
+    let attr_path: Option<&str> = match &cli.command {
+        Commands::Get { path } => Some(path),
+        Commands::Set { path, .. } => Some(path),
+        Commands::Delete { path } => Some(path),
+    };
+
+    let file = resolve_file(cli.file.as_deref(), flake_override, attr_path)?;
 
     match &cli.command {
         Commands::Get { path } => {
             let source = read_file(&file)?;
+            let ep = effective_path(path, &source);
             let root = ast::parse_nix(&source)?;
-            let value = ast::get_attr(&root, path)?;
+            let value = ast::get_attr(&root, ep)?;
             println!("{value}");
         }
         Commands::Set { path, value } => {
             let source = read_file(&file)?;
-            let result = ast::set_attr(&source, path, value)?;
+            let ep = effective_path(path, &source);
+            let result = ast::set_attr(&source, ep, value)?;
             write_and_verify(
                 &file,
                 &result,
@@ -325,7 +434,8 @@ fn main() -> Result<()> {
         }
         Commands::Delete { path } => {
             let source = read_file(&file)?;
-            let result = ast::delete_attr(&source, path)?;
+            let ep = effective_path(path, &source);
+            let result = ast::delete_attr(&source, ep)?;
             write_and_verify(&file, &result, &source, cli.no_verify, flake_override, None)?;
         }
     }
@@ -429,7 +539,7 @@ mod tests {
             .current_dir(tmpdir.path())
             .output();
 
-        let result = discover_file(tmpdir.path());
+        let result = discover_file(tmpdir.path(), None);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -440,6 +550,64 @@ mod tests {
             msg.contains("clanOptions = clan.options"),
             "expected hint about adding clanOptions, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_build_definition_filter_empty() {
+        let result = build_definition_filter(&[]);
+        assert_eq!(result, "defs: map (d: d.file) defs");
+    }
+
+    #[test]
+    fn test_build_definition_filter_one_segment() {
+        let result = build_definition_filter(&["machines"]);
+        assert!(result.contains(r#"d.value ? "machines""#));
+        assert!(result.contains("builtins.isAttrs d.value"));
+    }
+
+    #[test]
+    fn test_build_definition_filter_two_segments() {
+        let result = build_definition_filter(&["machines", "jon"]);
+        assert!(result.contains(r#"d.value ? "machines""#));
+        assert!(result.contains(r#"d.value."machines" ? "jon""#));
+    }
+
+    #[test]
+    fn test_build_definition_filter_special_chars() {
+        let result = build_definition_filter(&["machines", "3rd-node"]);
+        assert!(result.contains(r#"d.value."machines" ? "3rd-node""#));
+    }
+
+    #[test]
+    fn test_inventory_filter_segments() {
+        // Standard paths
+        assert_eq!(
+            inventory_filter_segments("inventory.machines.jon.deploy"),
+            Some(vec!["machines".to_string(), "jon".to_string()])
+        );
+        assert_eq!(
+            inventory_filter_segments("machines.jon"),
+            Some(vec!["machines".to_string(), "jon".to_string()])
+        );
+
+        // Flake-parts paths
+        assert_eq!(
+            inventory_filter_segments("clan.inventory.machines.jon"),
+            Some(vec!["machines".to_string(), "jon".to_string()])
+        );
+
+        // meta.name has 2 segments, so it's filterable
+        assert_eq!(
+            inventory_filter_segments("meta.name"),
+            Some(vec!["meta".to_string(), "name".to_string()])
+        );
+        assert_eq!(
+            inventory_filter_segments("clan.meta.name"),
+            Some(vec!["meta".to_string(), "name".to_string()])
+        );
+
+        // Single segment is too short
+        assert_eq!(inventory_filter_segments("meta"), None);
     }
 
     #[test]

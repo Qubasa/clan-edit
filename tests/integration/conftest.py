@@ -140,6 +140,23 @@ class EvalDir:
             check=check,
         )
 
+    def run_clan_edit_discover(
+        self,
+        *args: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run clan-edit with file discovery (no explicit --file).
+
+        Uses --flake to point at the eval dir, letting clan-edit discover
+        the correct file via definitionsWithLocations.
+        """
+        return run_clan_edit(
+            "--flake",
+            str(self.path),
+            *args,
+            check=check,
+        )
+
 
 @pytest.fixture()  # type: ignore[untyped-decorator]
 def eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
@@ -166,24 +183,21 @@ def eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
             shutil.copy2(src, tmpdir / extra)
             (tmpdir / extra).chmod(0o644)
 
-        # Create wrapping flake.nix (handles both plain attrset and
-        # function modules like {lib, ...}: { ... })
+        # Create wrapping flake.nix using imports for proper file tracking.
+        # This enables definitionsWithLocations to report which file each
+        # attribute is defined in.
         flake_content = f"""{{
   inputs = {{
     clan-core.url = "path:{CLAN_CORE_PATH}";
     nixpkgs.follows = "clan-core/nixpkgs";
   }};
 
-  outputs = {{ self, clan-core, nixpkgs, ... }}:
+  outputs = {{ self, clan-core, ... }}:
     let
-      rawModule = import ./clan.nix;
-      clanConfig =
-        if builtins.isFunction rawModule
-        then rawModule {{ lib = nixpkgs.lib; }}
-        else rawModule;
-      clan = clan-core.lib.clan ({{
+      clan = clan-core.lib.clan {{
         inherit self;
-      }} // clanConfig);
+        imports = [ ./clan.nix ];
+      }};
     in
     {{
       clan = clan.config;
@@ -233,13 +247,29 @@ def flake_parts_eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
   }};
 
   outputs = inputs@{{ flake-parts, ... }}:
-    flake-parts.lib.mkFlake {{ inherit inputs; }} {{
+    flake-parts.lib.mkFlake {{ inherit inputs; }} ({{ config, ... }}: {{
       systems = [ "x86_64-linux" "aarch64-linux" ];
       imports = [
         inputs.clan-core.flakeModules.default
         ./clan.nix
       ];
-    }};
+      # Expose the clan options tree via a separate evaluation.
+      # In flake-parts, config.flake.clan is the evaluated config (the
+      # apply function strips .options). We re-import the fixture and
+      # extract the clan config to evaluate it with lib.clan, which
+      # preserves the full evalModules result including .options.
+      flake.clanOptions = let
+        rawMod = import ./clan.nix;
+        modResult =
+          if builtins.isFunction rawMod
+          then rawMod {{ lib = inputs.clan-core.inputs.nixpkgs.lib; }}
+          else rawMod;
+        clanConfig = modResult.clan or {{}};
+        clan = inputs.clan-core.lib.clan ({{
+          self = inputs.self;
+        }} // clanConfig);
+      in clan.options;
+    }});
 }}
 """
         (tmpdir / "flake.nix").write_text(flake_content)

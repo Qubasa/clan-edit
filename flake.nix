@@ -60,7 +60,7 @@
             pname = "clan-edit";
             version = "0.1.0";
             src = ./.;
-            cargoHash = "sha256-VqtzS9hRnYNS+BXECDwU5ok50mEv6pgx5cLXROBlhb8=";
+            cargoHash = "sha256-40ru+/Wx+Jjc7VHlcDwzFUvEq46/jf3vwbwznzH50i0=";
           };
           default = clan-edit;
         }

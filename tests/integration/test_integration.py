@@ -680,6 +680,211 @@ def test_let_in_shared_variable_blocks_edit(
     assert "commonKey" not in content
 
 
+# ============================================================================
+# Multi-file source tracking tests
+# ============================================================================
+
+
+def test_multi_file_evaluates(eval_dir_factory: EvalDirFactory) -> None:
+    """Multi-file fixture (clan.nix + imported machine.nix) evaluates correctly."""
+    ed: EvalDir = eval_dir_factory(
+        "multi-file-clan.nix",
+        extra_fixtures=["multi-file-machines.nix"],
+    )
+    # Both machines should be accessible
+    result_sara = ed.nix_eval(f"{INV}.machines.sara.name")
+    assert result_sara == "sara"
+    result_jon = ed.nix_eval(f"{INV}.machines.jon.name")
+    assert result_jon == "jon"
+
+
+def test_multi_file_set_writes_to_imported_file(
+    eval_dir_factory: EvalDirFactory,
+) -> None:
+    """Set on machine in imported file writes to that file, not clan.nix."""
+    ed: EvalDir = eval_dir_factory(
+        "multi-file-clan.nix",
+        extra_fixtures=["multi-file-machines.nix"],
+    )
+    machines_nix = ed.path / "multi-file-machines.nix"
+    original_clan = ed.clan_nix.read_text()
+    original_machines = machines_nix.read_text()
+
+    # Edit jon (defined in multi-file-machines.nix) via discovery
+    ed.run_clan_edit_discover(
+        "set",
+        "--path",
+        "inventory.machines.jon.deploy.targetHost",
+        "--value",
+        '"10.0.0.99"',
+    )
+    ed.git_add()
+
+    # machine.nix should be modified
+    new_machines = machines_nix.read_text()
+    assert new_machines != original_machines
+    assert "10.0.0.99" in new_machines
+
+    # clan.nix should be unchanged
+    new_clan = ed.clan_nix.read_text()
+    assert new_clan == original_clan
+
+    # Verify via nix eval
+    result = ed.nix_eval(f"{INV}.machines.jon.deploy.targetHost")
+    assert result == "10.0.0.99"
+
+
+def test_multi_file_set_writes_to_clan_nix(
+    eval_dir_factory: EvalDirFactory,
+) -> None:
+    """Set on machine in clan.nix writes to clan.nix, not imported file."""
+    ed: EvalDir = eval_dir_factory(
+        "multi-file-clan.nix",
+        extra_fixtures=["multi-file-machines.nix"],
+    )
+    machines_nix = ed.path / "multi-file-machines.nix"
+    original_machines = machines_nix.read_text()
+
+    # Edit sara (defined in clan.nix) via discovery
+    ed.run_clan_edit_discover(
+        "set",
+        "--path",
+        "inventory.machines.sara.deploy.targetHost",
+        "--value",
+        '"10.0.0.88"',
+    )
+    ed.git_add()
+
+    # clan.nix should be modified
+    new_clan = ed.clan_nix.read_text()
+    assert "10.0.0.88" in new_clan
+
+    # machine.nix should be unchanged
+    new_machines = machines_nix.read_text()
+    assert new_machines == original_machines
+
+    # Verify via nix eval
+    result = ed.nix_eval(f"{INV}.machines.sara.deploy.targetHost")
+    assert result == "10.0.0.88"
+
+
+def test_multi_file_explicit_file_overrides(
+    eval_dir_factory: EvalDirFactory,
+) -> None:
+    """Explicit --file flag overrides source tracking."""
+    ed: EvalDir = eval_dir_factory(
+        "multi-file-clan.nix",
+        extra_fixtures=["multi-file-machines.nix"],
+    )
+
+    # Force writing to clan.nix even though jon is in machine.nix.
+    # This will add the path to clan.nix (not modify machine.nix).
+    ed.run_clan_edit(
+        "--no-verify",
+        "set",
+        "--path",
+        "inventory.machines.jon.tags",
+        "--value",
+        '[ "test" ]',
+    )
+
+    # clan.nix should contain the edit
+    content = ed.clan_nix.read_text()
+    assert "test" in content
+
+
+def test_multi_file_new_machine_falls_back(
+    eval_dir_factory: EvalDirFactory,
+) -> None:
+    """Set on a new (non-existent) machine falls back to default discovery."""
+    ed: EvalDir = eval_dir_factory(
+        "multi-file-clan.nix",
+        extra_fixtures=["multi-file-machines.nix"],
+    )
+
+    # newbox doesn't exist in any file, so discovery should fall back
+    # to the default file (clan.nix, the last local definition).
+    ed.run_clan_edit_discover(
+        "set",
+        "--path",
+        "inventory.machines.newbox",
+        "--value",
+        "{ }",
+    )
+    ed.git_add()
+
+    result = ed.nix_eval(f"{INV}.machines.newbox.name")
+    assert result == "newbox"
+
+
+# ============================================================================
+# Flake-parts options tree tests
+# ============================================================================
+
+
+def test_flake_parts_clanoptions_exposed(
+    flake_parts_eval_dir_factory: EvalDirFactory,
+) -> None:
+    """Flake-parts exposes clanOptions via config.flake.clan.options."""
+    ed: EvalDir = flake_parts_eval_dir_factory("flake-parts-simple.nix")
+    assert ed.nix_eval_succeeds("clanOptions")
+
+
+def test_flake_parts_multi_file_source_tracking(
+    flake_parts_eval_dir_factory: EvalDirFactory,
+) -> None:
+    """Multi-file source tracking works in flake-parts setup."""
+    ed: EvalDir = flake_parts_eval_dir_factory(
+        "flake-parts-multi-file-clan.nix",
+        extra_fixtures=["flake-parts-multi-file-machines.nix"],
+    )
+
+    # Both machines should be accessible
+    assert ed.nix_eval(f"{INV}.machines.sara.name") == "sara"
+    assert ed.nix_eval(f"{INV}.machines.jon.name") == "jon"
+
+    # Edit jon (defined in machines file) via discovery
+    machines_nix = ed.path / "flake-parts-multi-file-machines.nix"
+    original_clan = ed.clan_nix.read_text()
+
+    ed.run_clan_edit_discover(
+        "set",
+        "--path",
+        "clan.inventory.machines.jon.deploy.targetHost",
+        "--value",
+        '"10.0.0.99"',
+    )
+    ed.git_add()
+
+    # machines file should be modified
+    new_machines = machines_nix.read_text()
+    assert "10.0.0.99" in new_machines
+
+    # clan.nix should be unchanged
+    assert ed.clan_nix.read_text() == original_clan
+
+    # Verify via nix eval
+    assert ed.nix_eval(f"{INV}.machines.jon.deploy.targetHost") == "10.0.0.99"
+
+
+def test_flake_parts_options_discovery(
+    flake_parts_eval_dir_factory: EvalDirFactory,
+) -> None:
+    """clan-edit set works with flake-parts option discovery."""
+    ed: EvalDir = flake_parts_eval_dir_factory("flake-parts-simple.nix")
+    # Use discovery (no --file) to set a value
+    ed.run_clan_edit_discover(
+        "set",
+        "--path",
+        "clan.meta.name",
+        "--value",
+        '"DiscoveredEdit"',
+    )
+    ed.git_add()
+    result = ed.nix_eval(f"{INV}.meta.name")
+    assert result == "DiscoveredEdit"
+
+
 def test_discover_file_missing_clanoptions(eval_dir_factory: EvalDirFactory) -> None:
     """When clanOptions is not exposed, clan-edit gives a helpful error.
 

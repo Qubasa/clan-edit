@@ -238,8 +238,11 @@ fn discover_file(flake_dir: &Path, attr_path: Option<&str>) -> Result<PathBuf> {
     }
 
     bail!(
-        "clanOptions not exposed in flake outputs. \
-         Add `clanOptions = clan.options;` to your flake.nix outputs."
+        "clanOptions not exposed in flake outputs.\n\
+         For a standard flake, add `clanOptions = clan.options;` to your flake outputs.\n\
+         For flake-parts, add:\n  \
+           flake.clanOptions = options.flake.valueMeta.configuration.options.clan.valueMeta.configuration.options;\n\
+         Or use --file to specify the target file directly."
     )
 }
 
@@ -265,19 +268,13 @@ fn resolve_file(
         .or_else(|| find_flake_root_from_dir(&cwd));
 
     if let Some(flake_dir) = &flake_dir {
-        match discover_file(flake_dir, attr_path) {
-            Ok(path) => return Ok(path),
-            Err(_) => {
-                // Discovery failed; fall back to clan.nix in flake dir
-            }
-        }
+        return discover_file(flake_dir, attr_path);
     }
 
-    // Default: clan.nix in flake directory (if known) or current directory
-    match flake_dir {
-        Some(dir) => Ok(dir.join("clan.nix")),
-        None => Ok(PathBuf::from("clan.nix")),
-    }
+    bail!(
+        "No flake.nix found. Use --file to specify the target file, \
+         or run from within a flake directory."
+    )
 }
 
 /// Map a clan.nix attribute path to the corresponding flake output path under
@@ -549,6 +546,14 @@ mod tests {
         assert!(
             msg.contains("clanOptions = clan.options"),
             "expected hint about adding clanOptions, got: {msg}"
+        );
+        assert!(
+            msg.contains("--file"),
+            "expected hint about --file workaround, got: {msg}"
+        );
+        assert!(
+            msg.contains("flake-parts"),
+            "expected hint about flake-parts, got: {msg}"
         );
     }
 

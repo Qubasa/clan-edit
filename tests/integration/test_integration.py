@@ -36,9 +36,7 @@ def test_02_edit_meta_name(eval_dir_factory: EvalDirFactory) -> None:
 def test_03_add_machine(eval_dir_factory: EvalDirFactory) -> None:
     """Add machine, verify via nix eval."""
     ed: EvalDir = eval_dir_factory("minimal.nix")
-    ed.run_clan_edit(
-        "set", "--path", "inventory.machines.testbox", "--value", "{ }"
-    )
+    ed.run_clan_edit("set", "--path", "inventory.machines.testbox", "--value", "{ }")
     ed.git_add()
     result = ed.nix_eval(f"{INV}.machines.testbox.name")
     assert result == "testbox"
@@ -201,9 +199,7 @@ def test_17_special_names(eval_dir_factory: EvalDirFactory) -> None:
 def test_18_digit_prefixed_name(eval_dir_factory: EvalDirFactory) -> None:
     """Add machine with digit-prefixed name."""
     ed: EvalDir = eval_dir_factory("minimal.nix")
-    ed.run_clan_edit(
-        "set", "--path", "inventory.machines.3rd-node", "--value", "{ }"
-    )
+    ed.run_clan_edit("set", "--path", "inventory.machines.3rd-node", "--value", "{ }")
     ed.git_add()
     result = ed.nix_eval(f'{INV}.machines."3rd-node".name')
     assert result == "3rd-node"
@@ -212,9 +208,7 @@ def test_18_digit_prefixed_name(eval_dir_factory: EvalDirFactory) -> None:
 def test_19_space_in_name(eval_dir_factory: EvalDirFactory) -> None:
     """Add machine with space in name."""
     ed: EvalDir = eval_dir_factory("minimal.nix")
-    ed.run_clan_edit(
-        "set", "--path", "inventory.machines.my server", "--value", "{ }"
-    )
+    ed.run_clan_edit("set", "--path", "inventory.machines.my server", "--value", "{ }")
     ed.git_add()
     result = ed.nix_eval(f'{INV}.machines."my server".name')
     assert result == "my server"
@@ -254,9 +248,7 @@ def test_22_instance_let_binding_evaluates(eval_dir_factory: EvalDirFactory) -> 
 def test_23_editing_around_let_in_preserves(eval_dir_factory: EvalDirFactory) -> None:
     """Editing around a let-in instance preserves it."""
     ed: EvalDir = eval_dir_factory("instance-let-binding.nix")
-    ed.run_clan_edit(
-        "set", "--path", "inventory.machines.newbox", "--value", "{ }"
-    )
+    ed.run_clan_edit("set", "--path", "inventory.machines.newbox", "--value", "{ }")
     ed.git_add()
     assert ed.nix_eval_succeeds(f"{INV}.machines.newbox.name")
     assert ed.nix_eval_succeeds(f"{INV}.instances.sshd.module.name")
@@ -274,9 +266,7 @@ def test_24_replace_let_in_instance(eval_dir_factory: EvalDirFactory) -> None:
     };
     roles.server.tags.all = { };
   }"""
-    ed.run_clan_edit(
-        "set", "--path", "inventory.instances.sshd", "--value", new_value
-    )
+    ed.run_clan_edit("set", "--path", "inventory.instances.sshd", "--value", new_value)
     ed.git_add()
     result = ed.nix_eval(f"{INV}.instances.sshd.module.name")
     assert result == "sshd"
@@ -292,9 +282,7 @@ def test_24_replace_let_in_instance(eval_dir_factory: EvalDirFactory) -> None:
 def test_get_intermediate_path_roles(eval_dir_factory: EvalDirFactory) -> None:
     """Get intermediate path 'roles' from dotted-key bindings."""
     ed: EvalDir = eval_dir_factory("with-inventory.nix")
-    result = ed.run_clan_edit(
-        "get", "--path", "inventory.instances.sshd.roles"
-    )
+    result = ed.run_clan_edit("get", "--path", "inventory.instances.sshd.roles")
     output = result.stdout.strip()
     assert "server" in output
     assert "client" in output
@@ -303,9 +291,7 @@ def test_get_intermediate_path_roles(eval_dir_factory: EvalDirFactory) -> None:
 def test_get_intermediate_path_deep(eval_dir_factory: EvalDirFactory) -> None:
     """Get deeper intermediate path (roles.server)."""
     ed: EvalDir = eval_dir_factory("with-inventory.nix")
-    result = ed.run_clan_edit(
-        "get", "--path", "inventory.instances.sshd.roles.server"
-    )
+    result = ed.run_clan_edit("get", "--path", "inventory.instances.sshd.roles.server")
     output = result.stdout.strip()
     assert "tags" in output
 
@@ -314,9 +300,7 @@ def test_get_intermediate_path_module(eval_dir_factory: EvalDirFactory) -> None:
     """Get intermediate 'module' path from nested attrset."""
     ed: EvalDir = eval_dir_factory("with-inventory.nix")
     # module is a nested attrset, so exact lookup should work
-    result = ed.run_clan_edit(
-        "get", "--path", "inventory.instances.sshd.module"
-    )
+    result = ed.run_clan_edit("get", "--path", "inventory.instances.sshd.module")
     output = result.stdout.strip()
     assert "sshd" in output
 
@@ -351,9 +335,7 @@ def test_get_mkdefault_unwrap(eval_dir_factory: EvalDirFactory) -> None:
 def test_get_mkforce_unwrap(eval_dir_factory: EvalDirFactory) -> None:
     """Get unwraps lib.mkForce to return inner attrset."""
     ed: EvalDir = eval_dir_factory("with-mkdefault.nix")
-    result = ed.run_clan_edit(
-        "get", "--path", "inventory.machines.server"
-    )
+    result = ed.run_clan_edit("get", "--path", "inventory.machines.server")
     output = result.stdout.strip()
     assert "deploy.targetHost" in output
     assert "mkForce" not in output
@@ -387,9 +369,7 @@ def test_set_preserves_mkforce(eval_dir_factory: EvalDirFactory) -> None:
 def test_navigate_through_mkdefault_attrset(eval_dir_factory: EvalDirFactory) -> None:
     """Navigate into lib.mkDefault { ... } to read a sub-path."""
     ed: EvalDir = eval_dir_factory("with-mkdefault.nix")
-    result = ed.run_clan_edit(
-        "get", "--path", "inventory.instances.sshd.module.name"
-    )
+    result = ed.run_clan_edit("get", "--path", "inventory.instances.sshd.module.name")
     assert result.stdout.strip() == '"sshd"'
 
 
@@ -430,9 +410,7 @@ def test_get_merge_operator_subpath_module(eval_dir_factory: EvalDirFactory) -> 
 def test_get_whole_merge_value_succeeds(eval_dir_factory: EvalDirFactory) -> None:
     """Getting the whole // expression (without navigating into it) succeeds."""
     ed: EvalDir = eval_dir_factory("with-merge-operator.nix")
-    result = ed.run_clan_edit(
-        "get", "--path", "inventory.instances.machine-type"
-    )
+    result = ed.run_clan_edit("get", "--path", "inventory.instances.machine-type")
     assert "//" in result.stdout
 
 
@@ -452,9 +430,7 @@ def test_get_function_call_error(eval_dir_factory: EvalDirFactory) -> None:
 def test_get_whole_function_call_succeeds(eval_dir_factory: EvalDirFactory) -> None:
     """Getting the whole function call value succeeds."""
     ed: EvalDir = eval_dir_factory("with-function-call.nix")
-    result = ed.run_clan_edit(
-        "get", "--path", "inventory.instances.transformed"
-    )
+    result = ed.run_clan_edit("get", "--path", "inventory.instances.transformed")
     assert "someFunc" in result.stdout
 
 
@@ -566,9 +542,7 @@ def test_complex_let_bound_blocks(eval_dir_factory: EvalDirFactory) -> None:
 def test_complex_plain_navigable(eval_dir_factory: EvalDirFactory) -> None:
     """Plain attrset instance is navigable."""
     ed: EvalDir = eval_dir_factory("complex-expressions.nix")
-    result = ed.run_clan_edit(
-        "get", "--path", "inventory.instances.plain.module.name"
-    )
+    result = ed.run_clan_edit("get", "--path", "inventory.instances.plain.module.name")
     assert result.stdout.strip() == '"plain"'
 
 
@@ -668,9 +642,7 @@ def test_let_in_shared_variable_blocks_edit(
     roles.server.settings.authorizedKeys.admin = "ssh-ed25519 NEW-KEY";
     roles.server.settings.authorizedKeys.deploy = "ssh-ed25519 AAAA-shared-key";
   }"""
-    ed.run_clan_edit(
-        "set", "--path", "inventory.instances.sshd", "--value", new_value
-    )
+    ed.run_clan_edit("set", "--path", "inventory.instances.sshd", "--value", new_value)
     ed.git_add()
     result = ed.nix_eval(f"{INV}.instances.sshd.module.name")
     assert result == "sshd"
@@ -886,10 +858,10 @@ def test_flake_parts_options_discovery(
 
 
 def test_discover_file_missing_clanoptions(eval_dir_factory: EvalDirFactory) -> None:
-    """When clanOptions is not exposed, clan-edit gives a helpful error.
+    """When clanOptions is not exposed, --file still works as a workaround.
 
     This is tested at the unit level (test_discover_file_error_message in
-    main.rs), but we verify the CLI error message here too.
+    main.rs), but we verify the CLI behavior here too.
     """
     import shutil
     import tempfile
@@ -904,9 +876,9 @@ def test_discover_file_missing_clanoptions(eval_dir_factory: EvalDirFactory) -> 
         (tmpdir / "clan.nix").write_text('{ meta.name = "test"; }\n')
         git_init(tmpdir)
 
-        # clan-edit should fall back to clan.nix when discovery fails
         from conftest import run_clan_edit
 
+        # With explicit --file, it should work fine
         result = run_clan_edit(
             "--file",
             str(tmpdir / "clan.nix"),
@@ -914,7 +886,189 @@ def test_discover_file_missing_clanoptions(eval_dir_factory: EvalDirFactory) -> 
             "--path",
             "meta.name",
         )
-        # With explicit -f, it should work fine
         assert result.returncode == 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ============================================================================
+# clan-parts pattern tests (flake-parts with clan module imports)
+# ============================================================================
+
+
+def test_clan_parts_no_clanoptions_errors_on_discovery() -> None:
+    """Flake-parts without clanOptions errors instead of editing the wrong file.
+
+    Reproduces a bug where clan-edit would silently fall back to clan.nix and
+    edit the wrong file in a multi-file setup.  The clan-parts pattern uses
+    `clan = { imports = [ ./clan.nix ]; }` in flake.nix, and clan.nix imports
+    machines.nix.  Without clanOptions, discovery cannot determine which file
+    defines a given attribute, so it must error rather than guess.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from conftest import CLAN_CORE_PATH, git_init, run_clan_edit
+
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        # clan.nix: plain clan module that imports machines.nix
+        (tmpdir / "clan.nix").write_text(
+            """\
+{
+  imports = [ ./machines.nix ];
+  meta.name = "ClanPartsClan";
+}
+"""
+        )
+        # machines.nix: defines inventory.machines.asd
+        (tmpdir / "machines.nix").write_text(
+            """\
+{
+  inventory.machines.asd = {
+    deploy.targetHost = "root@example.com";
+  };
+}
+"""
+        )
+        # flake.nix: flake-parts WITHOUT clanOptions (mimics clan-parts)
+        (tmpdir / "flake.nix").write_text(
+            f"""\
+{{
+  inputs.clan-core.url = "path:{CLAN_CORE_PATH}";
+  inputs.nixpkgs.follows = "clan-core/nixpkgs";
+  inputs.flake-parts.follows = "clan-core/flake-parts";
+
+  outputs = inputs@{{ flake-parts, ... }}:
+    flake-parts.lib.mkFlake {{ inherit inputs; }} {{
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      imports = [ inputs.clan-core.flakeModules.default ];
+      clan = {{
+        imports = [ ./clan.nix ];
+      }};
+    }};
+}}
+"""
+        )
+        git_init(tmpdir)
+
+        # Try to edit via discovery (no --file) — should fail
+        result = run_clan_edit(
+            "--flake",
+            str(tmpdir),
+            "set",
+            "--path",
+            "inventory.machines.asd.icon",
+            "--value",
+            '"asd.png"',
+            check=False,
+        )
+
+        assert result.returncode != 0, (
+            "Expected clan-edit to error when clanOptions is not exposed, "
+            "but it succeeded (likely edited the wrong file)"
+        )
+        assert "clanOptions" in result.stderr, (
+            f"Expected error about clanOptions, got: {result.stderr}"
+        )
+
+        # Verify clan.nix was NOT modified (the old bug would edit it)
+        clan_content = (tmpdir / "clan.nix").read_text()
+        assert "icon" not in clan_content, (
+            "clan.nix was modified despite discovery failure — "
+            "this is the bug where edits go to the wrong file"
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_clan_parts_with_clanoptions_discovers_correct_file() -> None:
+    """Flake-parts with clanOptions discovers the correct file in multi-file setup.
+
+    When clanOptions IS exposed, clan-edit should use definitionsWithLocations
+    to find that inventory.machines.asd is defined in machines.nix, and edit
+    that file instead of clan.nix.
+    """
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from conftest import CLAN_CORE_PATH, git_init, run_clan_edit
+
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        # clan.nix: plain clan module that imports machines.nix
+        (tmpdir / "clan.nix").write_text(
+            """\
+{
+  imports = [ ./machines.nix ];
+  meta.name = "ClanPartsClan";
+}
+"""
+        )
+        # machines.nix: defines inventory.machines.asd
+        (tmpdir / "machines.nix").write_text(
+            """\
+{
+  inventory.machines.asd = {
+    deploy.targetHost = "root@example.com";
+  };
+}
+"""
+        )
+        # flake.nix: flake-parts WITH clanOptions exposed
+        (tmpdir / "flake.nix").write_text(
+            f"""\
+{{
+  inputs.clan-core.url = "path:{CLAN_CORE_PATH}";
+  inputs.nixpkgs.follows = "clan-core/nixpkgs";
+  inputs.flake-parts.follows = "clan-core/flake-parts";
+
+  outputs = inputs@{{ flake-parts, ... }}:
+    flake-parts.lib.mkFlake {{ inherit inputs; }} {{
+      systems = [ "x86_64-linux" "aarch64-linux" ];
+      imports = [ inputs.clan-core.flakeModules.default ];
+      clan = {{
+        imports = [ ./clan.nix ];
+      }};
+      flake.clanOptions = let
+        clan = inputs.clan-core.lib.clan {{
+          self = inputs.self;
+          imports = [ ./clan.nix ];
+        }};
+      in clan.options;
+    }};
+}}
+"""
+        )
+        git_init(tmpdir)
+
+        original_clan = (tmpdir / "clan.nix").read_text()
+
+        # Edit via discovery — should find machines.nix
+        result = run_clan_edit(
+            "--flake",
+            str(tmpdir),
+            "set",
+            "--path",
+            "inventory.machines.asd.icon",
+            "--value",
+            '"asd.png"',
+        )
+        assert result.returncode == 0, f"clan-edit failed: {result.stderr}"
+
+        # machines.nix should be modified
+        machines_content = (tmpdir / "machines.nix").read_text()
+        assert "icon" in machines_content, (
+            "machines.nix was not modified — discovery did not find the right file"
+        )
+        assert '"asd.png"' in machines_content
+
+        # clan.nix should be unchanged
+        new_clan = (tmpdir / "clan.nix").read_text()
+        assert new_clan == original_clan, (
+            "clan.nix was modified — edit went to the wrong file"
+        )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

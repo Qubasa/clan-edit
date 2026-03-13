@@ -163,9 +163,7 @@ def eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
     """Factory fixture that creates eval dirs from a fixture file."""
     created_dirs: list[Path] = []
 
-    def _create(
-        fixture_name: str, extra_fixtures: list[str] | None = None
-    ) -> EvalDir:
+    def _create(fixture_name: str, extra_fixtures: list[str] | None = None) -> EvalDir:
         fixture_path = Path(FIXTURES_DIR) / fixture_name
         assert fixture_path.exists(), f"Fixture not found: {fixture_path}"
 
@@ -220,9 +218,7 @@ def flake_parts_eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
     """Factory fixture that creates flake-parts eval dirs."""
     created_dirs: list[Path] = []
 
-    def _create(
-        fixture_name: str, extra_fixtures: list[str] | None = None
-    ) -> EvalDir:
+    def _create(fixture_name: str, extra_fixtures: list[str] | None = None) -> EvalDir:
         fixture_path = Path(FIXTURES_DIR) / fixture_name
         assert fixture_path.exists(), f"Fixture not found: {fixture_path}"
 
@@ -254,20 +250,26 @@ def flake_parts_eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
         ./clan.nix
       ];
       # Expose the clan options tree via a separate evaluation.
-      # In flake-parts, config.flake.clan is the evaluated config (the
-      # apply function strips .options). We re-import the fixture and
-      # extract the clan config to evaluate it with lib.clan, which
-      # preserves the full evalModules result including .options.
+      # We re-import the fixture and extract the clan config, wrapping
+      # it as a module with _file so that definitionsWithLocations
+      # properly tracks which file defines each attribute.
       flake.clanOptions = let
         rawMod = import ./clan.nix;
         modResult =
           if builtins.isFunction rawMod
           then rawMod {{ lib = inputs.clan-core.inputs.nixpkgs.lib; }}
           else rawMod;
-        clanConfig = modResult.clan or {{}};
-        clan = inputs.clan-core.lib.clan ({{
+        clanAttrs = modResult.clan or {{}};
+        clan = inputs.clan-core.lib.clan {{
           self = inputs.self;
-        }} // clanConfig);
+          imports = [
+            {{
+              _file = toString ./clan.nix;
+              imports = clanAttrs.imports or [];
+              config = builtins.removeAttrs clanAttrs ["imports"];
+            }}
+          ];
+        }};
       in clan.options;
     }});
 }}

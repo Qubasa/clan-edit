@@ -78,6 +78,7 @@ dependencies = [
  "clap",
  "rnix",
  "rowan",
+ "serde_json",
  "tempfile",
 ]
 

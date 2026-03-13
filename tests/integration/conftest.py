@@ -17,7 +17,9 @@ import pytest  # type: ignore[import-not-found]
 class EvalDirFactory(Protocol):
     """Protocol for eval dir factory callables."""
 
-    def __call__(self, fixture_name: str) -> EvalDir: ...
+    def __call__(
+        self, fixture_name: str, extra_fixtures: list[str] | None = None
+    ) -> EvalDir: ...
 
 
 CLAN_CORE_PATH: str = os.environ.get("CLAN_CORE_PATH", "")
@@ -144,7 +146,9 @@ def eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
     """Factory fixture that creates eval dirs from a fixture file."""
     created_dirs: list[Path] = []
 
-    def _create(fixture_name: str) -> EvalDir:
+    def _create(
+        fixture_name: str, extra_fixtures: list[str] | None = None
+    ) -> EvalDir:
         fixture_path = Path(FIXTURES_DIR) / fixture_name
         assert fixture_path.exists(), f"Fixture not found: {fixture_path}"
 
@@ -154,6 +158,13 @@ def eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
         # Copy fixture as clan.nix
         shutil.copy2(fixture_path, tmpdir / "clan.nix")
         (tmpdir / "clan.nix").chmod(0o644)
+
+        # Copy any additional fixture files (kept under their original name)
+        for extra in extra_fixtures or []:
+            src = Path(FIXTURES_DIR) / extra
+            assert src.exists(), f"Extra fixture not found: {src}"
+            shutil.copy2(src, tmpdir / extra)
+            (tmpdir / extra).chmod(0o644)
 
         # Create wrapping flake.nix (handles both plain attrset and
         # function modules like {lib, ...}: { ... })
@@ -195,7 +206,9 @@ def flake_parts_eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
     """Factory fixture that creates flake-parts eval dirs."""
     created_dirs: list[Path] = []
 
-    def _create(fixture_name: str) -> EvalDir:
+    def _create(
+        fixture_name: str, extra_fixtures: list[str] | None = None
+    ) -> EvalDir:
         fixture_path = Path(FIXTURES_DIR) / fixture_name
         assert fixture_path.exists(), f"Fixture not found: {fixture_path}"
 
@@ -204,6 +217,13 @@ def flake_parts_eval_dir_factory() -> Generator[EvalDirFactory, None, None]:
 
         shutil.copy2(fixture_path, tmpdir / "clan.nix")
         (tmpdir / "clan.nix").chmod(0o644)
+
+        # Copy any additional fixture files (kept under their original name)
+        for extra in extra_fixtures or []:
+            src = Path(FIXTURES_DIR) / extra
+            assert src.exists(), f"Extra fixture not found: {src}"
+            shutil.copy2(src, tmpdir / extra)
+            (tmpdir / extra).chmod(0o644)
 
         flake_content = f"""{{
   inputs = {{

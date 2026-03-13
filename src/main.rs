@@ -83,24 +83,27 @@ pub fn find_flake_root_from_dir(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Run `nix eval` with `--apply` and `--raw` to extract the file path from a
+/// Run `nix eval` to extract all definition file paths from a
 /// `definitionsWithLocations` attribute.
-fn nix_eval_definition_file(flake_dir: &Path, attr: &str) -> Result<String> {
+fn nix_eval_definition_files(flake_dir: &Path, attr: &str) -> Result<Vec<String>> {
     let flake_ref = format!("path:{}#{}", flake_dir.display(), attr);
     let output = Command::new("nix")
         .args([
             "eval",
             &flake_ref,
             "--apply",
-            "defs: (builtins.head defs).file",
-            "--raw",
+            "defs: map (d: d.file) defs",
+            "--json",
             "--no-warn-dirty",
         ])
         .output()
         .context("failed to run nix eval for option discovery")?;
 
     if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let files: Vec<String> =
+            serde_json::from_str(&stdout).context("failed to parse definition files as JSON")?;
+        Ok(files)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("nix eval failed for {attr}:\n{stderr}")
@@ -122,24 +125,44 @@ fn store_path_to_real_path(store_file: &str, flake_dir: &Path) -> PathBuf {
     PathBuf::from(store_file)
 }
 
+/// From a list of store paths returned by `definitionsWithLocations`, find the
+/// one that maps to a real file in the user's flake directory.  Definitions from
+/// flake inputs (clan-core internals) won't exist on disk so we skip them.
+fn find_local_definition(files: &[String], flake_dir: &Path) -> Option<PathBuf> {
+    for store_file in files.iter().rev() {
+        let real = store_path_to_real_path(store_file, flake_dir);
+        if real.is_file() {
+            return Some(real);
+        }
+    }
+    None
+}
+
 /// Discover the file that defines inventory options by evaluating
 /// `definitionsWithLocations` from the flake outputs.
 ///
 /// Tries `clanOptions.inventory.definitionsWithLocations` (non-flake-parts)
 /// first, then `clan.options.inventory.definitionsWithLocations` (flake-parts).
+///
+/// From the returned definitions, picks the one that maps to an actual file in
+/// the user's flake directory (skipping clan-core internal modules).
 fn discover_file(flake_dir: &Path) -> Result<PathBuf> {
     // Try non-flake-parts
-    if let Ok(file) =
-        nix_eval_definition_file(flake_dir, "clanOptions.inventory.definitionsWithLocations")
+    if let Ok(files) =
+        nix_eval_definition_files(flake_dir, "clanOptions.inventory.definitionsWithLocations")
     {
-        return Ok(store_path_to_real_path(&file, flake_dir));
+        if let Some(path) = find_local_definition(&files, flake_dir) {
+            return Ok(path);
+        }
     }
 
     // Try flake-parts
-    if let Ok(file) =
-        nix_eval_definition_file(flake_dir, "clan.options.inventory.definitionsWithLocations")
+    if let Ok(files) =
+        nix_eval_definition_files(flake_dir, "clan.options.inventory.definitionsWithLocations")
     {
-        return Ok(store_path_to_real_path(&file, flake_dir));
+        if let Some(path) = find_local_definition(&files, flake_dir) {
+            return Ok(path);
+        }
     }
 
     bail!(
@@ -161,17 +184,20 @@ fn resolve_file(explicit_file: Option<&Path>, flake_override: Option<&Path>) -> 
         .map(|p| p.to_path_buf())
         .or_else(|| find_flake_root_from_dir(&cwd));
 
-    if let Some(flake_dir) = flake_dir {
-        match discover_file(&flake_dir) {
+    if let Some(flake_dir) = &flake_dir {
+        match discover_file(flake_dir) {
             Ok(path) => return Ok(path),
             Err(_) => {
-                // Discovery failed; fall back to default
+                // Discovery failed; fall back to clan.nix in flake dir
             }
         }
     }
 
-    // Default
-    Ok(PathBuf::from("clan.nix"))
+    // Default: clan.nix in flake directory (if known) or current directory
+    match flake_dir {
+        Some(dir) => Ok(dir.join("clan.nix")),
+        None => Ok(PathBuf::from("clan.nix")),
+    }
 }
 
 /// Map a clan.nix attribute path to the corresponding flake output path under

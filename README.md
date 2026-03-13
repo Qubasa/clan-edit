@@ -233,6 +233,109 @@ clan-edit set --path inventory.machines.newbox --value '{ }'
 # The sshd let...in is untouched
 ```
 
+### `lib.mkDefault` and `lib.mkForce` wrappers
+
+clan-edit recognizes `lib.mkDefault` and `lib.mkForce` wrappers and handles them transparently:
+
+- **Reading**: `get` unwraps the wrapper and returns the inner value. You see `"hello"`, not `lib.mkDefault "hello"`.
+- **Setting**: `set` preserves the wrapper -- if the original value was `lib.mkDefault "old"`, setting it to `"new"` produces `lib.mkDefault "new"`.
+- **Navigating into `mkDefault` attrsets**: When an attrset is wrapped in `lib.mkDefault { ... }`, you can navigate into it normally. `get --path inventory.instances.sshd.module.name` works through the wrapper.
+
+```nix
+# This fixture:
+meta.name = lib.mkDefault "DefaultClan";
+inventory.machines.server = lib.mkForce {
+  deploy.targetHost = "10.0.0.1";
+};
+```
+
+```bash
+# Reading unwraps:
+clan-edit get --path meta.name
+# => "DefaultClan"  (not lib.mkDefault "DefaultClan")
+
+# Setting preserves the wrapper:
+clan-edit set --path meta.name --value '"NewName"'
+# File now contains: meta.name = lib.mkDefault "NewName";
+
+# Navigating into mkDefault attrsets works:
+clan-edit get --path inventory.machines.server.deploy.targetHost
+# => "10.0.0.1"
+```
+
+Other `lib.*` functions (e.g., `lib.mkMerge`, `lib.mkIf`) are not recognized and are treated as opaque function applications.
+
+### Merge operator (`//`) and function applications
+
+When a value at the target path uses the merge operator (`//`) or is a function call, clan-edit cannot navigate into it:
+
+```nix
+# Merge operator
+inventory.instances.machine-type = {
+  module.name = "merged";
+} // {
+  roles.server.tags.all = { };
+};
+
+# Function application
+inventory.instances.transformed = someFunc {
+  module.name = "transformed";
+};
+```
+
+```bash
+# Getting the whole value works:
+clan-edit get --path inventory.instances.machine-type
+# => { module.name = "merged"; } // { roles.server.tags.all = { }; }
+
+# Navigating into it fails with a descriptive error:
+clan-edit get --path inventory.instances.machine-type.module
+# Error: cannot navigate into merge operator (//) expression
+
+clan-edit get --path inventory.instances.transformed.module
+# Error: cannot navigate into function application expression
+
+# Setting through these also fails:
+clan-edit set --path inventory.instances.machine-type.module.name --value '"new"'
+# Error: cannot navigate into merge operator (//) expression
+
+# But replacing the whole value works:
+clan-edit set --path inventory.instances.machine-type --value '{
+    module.name = "merged";
+    roles.server.tags.all = { };
+  }'
+```
+
+### `let ... in` with shared variables
+
+When a `let ... in` wraps an instance value and the let variable is used by multiple bindings, clan-edit cannot selectively override one usage without replacing the entire expression:
+
+```nix
+inventory.instances.sshd = let
+  commonKey = "ssh-ed25519 AAAA-shared-key";
+in {
+  module.name = "sshd";
+  roles.server.settings.authorizedKeys.admin = commonKey;
+  roles.server.settings.authorizedKeys.deploy = commonKey;
+};
+```
+
+```bash
+# Cannot edit just admin -- blocked by the let-in:
+clan-edit set --path inventory.instances.sshd.roles.server.settings.authorizedKeys.admin \
+  --value '"ssh-ed25519 NEW-KEY"'
+# Error: cannot navigate into let-in expression
+
+# Must replace the whole instance (losing the let binding):
+clan-edit set --path inventory.instances.sshd --value '{
+    module.name = "sshd";
+    roles.server.settings.authorizedKeys.admin = "ssh-ed25519 NEW-KEY";
+    roles.server.settings.authorizedKeys.deploy = "ssh-ed25519 AAAA-shared-key";
+  }'
+```
+
+Top-level `let ... in { ... }` at the file root is transparent -- you can navigate through it freely. Only `let ... in` expressions used as *values* inside an attrset are opaque.
+
 ### Flake-parts projects
 
 For projects using flake-parts with clan-core's flake module, attribute paths are prefixed with `clan.`:
@@ -241,6 +344,8 @@ For projects using flake-parts with clan-core's flake module, attribute paths ar
 clan-edit --file clan.nix set --path clan.meta.name --value '"MyFlakePartsClan"'
 clan-edit --file clan.nix set --path clan.inventory.machines.server --value '{ }'
 ```
+
+Inventory settings can be split across files. If `clan.nix` does `inventory = import ./inventory-settings.nix;`, edits to attributes defined directly in `clan.nix` (like `clan.meta.name`) work normally, while the imported file remains untouched.
 
 ## Verification
 
@@ -261,21 +366,35 @@ clan-edit --no-verify set --path meta.name --value '"Unverified"'
 clan-edit --flake /path/to/my/flake set --path meta.name --value '"Hello"'
 ```
 
-## Restrictions
+## File discovery
+
+When `--file` is not given, clan-edit auto-discovers which file to edit:
+
+1. Finds the flake root (from `--flake` or by walking up from the current directory)
+2. Evaluates `clanOptions.inventory.definitionsWithLocations` (non-flake-parts) or `clan.options.inventory.definitionsWithLocations` (flake-parts) to get all definition file paths
+3. Picks the definition that maps to an actual file in the user's flake directory (skipping clan-core internal modules)
+4. Falls back to `clan.nix` in the flake directory if discovery fails
+
+This means `--flake /path/to/project` works out of the box for standard clan projects -- it will find and edit the correct file even when clan-core's module system contributes its own definitions to the inventory option.
+
+## Edge cases and restrictions
 
 **Syntax-only editing, evaluation-based verification.** clan-edit parses Nix syntax but does not evaluate it during editing. It cannot resolve variables, follow imports, or compute expressions. Verification is a separate post-write step using `nix eval`.
 
 **Literal values only for `set`.** The `--value` must be a syntactically valid Nix expression that can be pasted directly into the source.
 
-**Cannot modify inside expressions.** If a value at the target path is a function call, `let` binding, or other complex expression, `set` will replace the entire expression. It cannot navigate into or modify sub-parts of non-attrset values. See the [`let ... in` section above](#let--in-bindings-inside-attribute-values) for details.
+**Opaque expressions -- cannot navigate into:**
+- **`let ... in` values** -- instance values wrapped in `let ... in { ... }` are opaque. You can read/replace the whole expression but not navigate into the body. Top-level `let ... in` at the file root is transparent. See [`let ... in` section](#let--in-bindings-inside-attribute-values) and [shared variables](#let--in-with-shared-variables).
+- **Merge operator (`//`)** -- values using `{ ... } // { ... }` cannot be navigated into. See [merge operator section](#merge-operator--and-function-applications).
+- **Function applications** -- values like `someFunc { ... }` are opaque, except `lib.mkDefault` and `lib.mkForce` which are recognized and handled transparently. See [mkDefault/mkForce section](#libmkdefault-and-libmkforce-wrappers) and [merge/function section](#merge-operator--and-function-applications).
 
-**`let` bindings are preserved but opaque.** Top-level `let ... in { ... }` and `let ... in` values inside attributes are both supported -- edits elsewhere preserve them. However, clan-edit cannot navigate into `let` bodies. See above for examples.
+**`lib.mkDefault`/`lib.mkForce` transparency.** These wrappers are the only function applications clan-edit can see through. Reading unwraps them, setting preserves them, and you can navigate into wrapped attrsets. Other `lib.*` functions are treated as opaque.
 
 **Lambda expressions supported.** Flake-parts module files (`{ ... }: { ... }`) are handled correctly.
 
-**Dot-separated paths only.** Attribute keys are split on `.`, so names containing literal dots cannot be addressed. Keys with spaces, dashes, and digit prefixes work fine -- clan-edit auto-quotes them. See the [special characters section above](#special-characters-in-attribute-names).
+**Dot-separated paths only.** Attribute keys are split on `.`, so names containing literal dots cannot be addressed. Keys with spaces, dashes, and digit prefixes work fine -- clan-edit auto-quotes them. See the [special characters section](#special-characters-in-attribute-names).
 
-**Single file.** Only one file is read and written per invocation.
+**Single file.** Only one file is read and written per invocation. If inventory settings are imported from another file, clan-edit can only edit attributes in the file it was pointed to.
 
 ## Testing
 
@@ -283,14 +402,17 @@ clan-edit --flake /path/to/my/flake set --path meta.name --value '"Hello"'
 # Unit tests (pure Rust, no Nix needed)
 cargo test
 
-# Integration tests (requires Nix and clan-core, runs via nix)
-nix run .#integration-tests
+# All checks (unit + integration tests) via nix
+nix build .#checks.x86_64-linux.unit-tests
+nix build .#checks.x86_64-linux.integration-tests
 
-# Unit tests via nix flake check
+# Or run everything at once
 nix flake check
 ```
 
 The integration tests create temporary flakes that import edited `clan.nix` files via `clan-core.lib.clan`, then run `nix eval` to verify the edits produce valid inventory configurations. This catches issues that syntax-level tests cannot: wrong attribute names, type mismatches, missing required fields.
+
+The integration tests run inside the nix sandbox with a pre-populated local nix store and `--override-input` flags to avoid network access.
 
 ## Project structure
 

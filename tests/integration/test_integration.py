@@ -596,6 +596,90 @@ def test_discover_file_flake_parts(
     assert ed.nix_eval_succeeds(f"{INV}.meta.name")
 
 
+def test_flake_parts_separate_file(
+    flake_parts_eval_dir_factory: EvalDirFactory,
+) -> None:
+    """Flake-parts with inventory imported from a separate file.
+
+    Tests that editing clan.nix works when inventory is imported from
+    another file, and that the imported file remains intact.
+    """
+    ed: EvalDir = flake_parts_eval_dir_factory(
+        "flake-parts-separate-file.nix",
+        extra_fixtures=["inventory-settings.nix"],
+    )
+    # Verify initial evaluation works
+    result = ed.nix_eval(f"{INV}.meta.name")
+    assert result == "SeparateFileClan"
+
+    # Edit meta.name (defined directly in clan.nix)
+    ed.run_clan_edit(
+        "set",
+        "--path",
+        "clan.meta.name",
+        "--value",
+        '"EditedSeparate"',
+    )
+    ed.git_add()
+    result = ed.nix_eval(f"{INV}.meta.name")
+    assert result == "EditedSeparate"
+
+    # Verify the imported inventory-settings.nix is still intact
+    result = ed.nix_eval(f"{INV}.instances.sshd.module.name")
+    assert result == "sshd"
+
+
+def test_let_in_shared_variable_blocks_edit(
+    eval_dir_factory: EvalDirFactory,
+) -> None:
+    """Editing through a let-in instance value is blocked.
+
+    When an instance value is `let x = ...; in { ... }`, navigating into
+    it to edit a sub-path fails because the let-in is opaque to the AST
+    editor.  This test documents this limitation: both bindings reference
+    `commonKey`, and we cannot selectively override one without replacing
+    the whole let-in expression.
+    """
+    ed: EvalDir = eval_dir_factory("let-shared-variable.nix")
+
+    # Verify the fixture evaluates
+    result = ed.nix_eval(f"{INV}.meta.name")
+    assert result == "LetSharedClan"
+
+    # Trying to set a path *through* the let-in should fail
+    result = ed.run_clan_edit(
+        "set",
+        "--path",
+        "inventory.instances.sshd.roles.server.settings.authorizedKeys.admin",
+        "--value",
+        '"ssh-ed25519 NEW-KEY"',
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "let-in" in result.stderr.lower()
+
+    # But we can replace the whole instance value (losing the let binding)
+    new_value = """{
+    module = {
+      name = "sshd";
+      input = "clan-core";
+    };
+    roles.server.tags.all = { };
+    roles.server.settings.authorizedKeys.admin = "ssh-ed25519 NEW-KEY";
+    roles.server.settings.authorizedKeys.deploy = "ssh-ed25519 AAAA-shared-key";
+  }"""
+    ed.run_clan_edit(
+        "set", "--path", "inventory.instances.sshd", "--value", new_value
+    )
+    ed.git_add()
+    result = ed.nix_eval(f"{INV}.instances.sshd.module.name")
+    assert result == "sshd"
+
+    # The let binding should be gone (replaced with literal value)
+    content = ed.clan_nix.read_text()
+    assert "commonKey" not in content
+
+
 def test_discover_file_missing_clanoptions(eval_dir_factory: EvalDirFactory) -> None:
     """When clanOptions is not exposed, clan-edit gives a helpful error.
 
